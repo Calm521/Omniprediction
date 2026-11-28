@@ -17,7 +17,7 @@
 > You only need to: Upload seed materials (data analysis reports or interesting novel stories) and describe your prediction requirements in natural language</br>
 > Omniprediction will return: A detailed prediction report and a deeply interactive high-fidelity digital world
 
-### Our Vision
+### My Vision
 
 Omniprediction is dedicated to creating a swarm intelligence mirror that maps reality. By capturing the collective emergence triggered by individual interactions, we break through the limitations of traditional prediction:
 
