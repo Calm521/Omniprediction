@@ -19,7 +19,7 @@ from ..utils.zep import (
     get_zep_client,
 )
 
-logger = get_logger('mirofish.zep_graph_memory_updater')
+logger = get_logger('omniprediction.zep_graph_memory_updater')
 
 
 @dataclass
@@ -498,7 +498,7 @@ class ZepGraphMemoryUpdater:
                     created_at=self._to_rfc3339(payload_activities[-1].timestamp),
                     source_description="Omniprediction simulation activity batch",
                     metadata={
-                        "source": "mirofish_simulation",
+                        "source": "omniprediction_simulation",
                         "simulation_id": self.simulation_id,
                         "platform": platform,
                         "activity_count": len(payload_activities),

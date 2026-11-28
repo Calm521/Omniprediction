@@ -1,5 +1,5 @@
 """
-MiroFish Backend 启动入口
+Omniprediction Backend 启动入口
 """
 
 import os

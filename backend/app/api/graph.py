@@ -28,7 +28,7 @@ from ..services.zep_graph_memory_updater import ZepGraphMemoryManager
 from ..utils.llm_client import LLMResponseError
 
 # 获取日志器
-logger = get_logger('mirofish.api')
+logger = get_logger('omniprediction.api')
 _build_locks: dict[str, threading.Lock] = {}
 _build_locks_guard = threading.Lock()
 
@@ -650,7 +650,7 @@ def _build_graph_impl():
         # 启动后台任务
         def build_task():
             set_locale(current_locale)
-            build_logger = get_logger('mirofish.build')
+            build_logger = get_logger('omniprediction.build')
             try:
                 build_logger.info(f"[{task_id}] 开始构建图谱...")
                 task_manager.update_task(
