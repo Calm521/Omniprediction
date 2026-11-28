@@ -31,16 +31,16 @@ From serious predictions to playful simulations, we let every "what if" see its 
 <div align="center">
 <table>
 <tr>
-<td><img src="./static/image/Screenshot/运行截图1.png" alt="Screenshot 1" width="100%"/></td>
-<td><img src="./static/image/Screenshot/运行截图2.png" alt="Screenshot 2" width="100%"/></td>
+<td><img src="./static/image/Screenshot/运行截图1.webp" alt="Screenshot 1" width="100%"/></td>
+<td><img src="./static/image/Screenshot/运行截图2.webp" alt="Screenshot 2" width="100%"/></td>
 </tr>
 <tr>
-<td><img src="./static/image/Screenshot/运行截图3.png" alt="Screenshot 3" width="100%"/></td>
-<td><img src="./static/image/Screenshot/运行截图4.png" alt="Screenshot 4" width="100%"/></td>
+<td><img src="./static/image/Screenshot/运行截图3.webp" alt="Screenshot 3" width="100%"/></td>
+<td><img src="./static/image/Screenshot/运行截图4.webp" alt="Screenshot 4" width="100%"/></td>
 </tr>
 <tr>
-<td><img src="./static/image/Screenshot/运行截图5.png" alt="Screenshot 5" width="100%"/></td>
-<td><img src="./static/image/Screenshot/运行截图6.png" alt="Screenshot 6" width="100%"/></td>
+<td><img src="./static/image/Screenshot/运行截图5.webp" alt="Screenshot 5" width="100%"/></td>
+<td><img src="./static/image/Screenshot/运行截图6.webp" alt="Screenshot 6" width="100%"/></td>
 </tr>
 </table>
 </div>

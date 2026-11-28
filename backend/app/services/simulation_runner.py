@@ -148,9 +148,13 @@ class SimulationRunState:
     
     # 错误信息
     error: Optional[str] = None
-    
+
     # 进程ID（用于停止）
     process_pid: Optional[int] = None
+
+    # 环境（进程）是否存活 —— 与仿真运行状态解耦。
+    # 仿真 COMPLETED 后进程仍可存活，以支持采访 Agent。
+    env_alive: bool = False
     
     def add_action(self, action: AgentAction):
         """添加动作到最近动作列表"""
@@ -191,6 +195,7 @@ class SimulationRunState:
             "completed_at": self.completed_at,
             "error": self.error,
             "process_pid": self.process_pid,
+            "env_alive": self.env_alive,
         }
     
     def to_detail_dict(self) -> Dict[str, Any]:
@@ -237,6 +242,8 @@ class SimulationRunner:
     _finalization_locks: Dict[str, threading.Lock] = {}
     _finalization_locks_guard = threading.Lock()
     _manual_stop_requests: set[str] = set()
+    # 已发布终态的仿真：监控循环据此停止覆写状态字段
+    _completed_simulations: set[str] = set()
 
     @classmethod
     def _finalization_lock(cls, simulation_id: str) -> threading.Lock:
@@ -331,6 +338,7 @@ class SimulationRunner:
                 completed_at=data.get("completed_at"),
                 error=data.get("error"),
                 process_pid=data.get("process_pid"),
+                env_alive=data.get("env_alive", False),
             )
             
             # 加载最近动作
@@ -639,18 +647,26 @@ class SimulationRunner:
         exit_code: int | None = None
         try:
             while process.poll() is None:  # 进程仍在运行
+                # 终态已发布（所有平台完成）后，进程会停在等待命令模式。
+                # 此时不再读取动作、也不再覆写状态，避免把 COMPLETED 写回 RUNNING。
+                # 进程保持存活，采访能力不受影响。
+                if state.simulation_id in cls._completed_simulations:
+                    # 仍要盯住进程退出，以便进程结束（close-env）后回收资源
+                    time.sleep(2)
+                    continue
+
                 # 读取 Twitter 动作日志
                 if os.path.exists(twitter_actions_log):
                     twitter_position = cls._read_action_log(
                         twitter_actions_log, twitter_position, state, "twitter"
                     )
-                
+
                 # 读取 Reddit 动作日志
                 if os.path.exists(reddit_actions_log):
                     reddit_position = cls._read_action_log(
                         reddit_actions_log, reddit_position, state, "reddit"
                     )
-                
+
                 # 更新状态
                 cls._save_run_state(state)
                 time.sleep(2)
@@ -676,7 +692,24 @@ class SimulationRunner:
                 if latest_state is not None:
                     state = latest_state
 
-                if state.runner_status not in {
+                # 进程已退出，环境不再存活（采访能力随之失效）。
+                # 若终态已在此前发布（所有平台完成时），保留该终态不覆盖。
+                previous_terminal = (
+                    state.runner_status == RunnerStatus.COMPLETED
+                    and simulation_id in cls._completed_simulations
+                )
+                if previous_terminal:
+                    state.env_alive = False
+                    state.twitter_running = False
+                    state.reddit_running = False
+                    cls._save_run_state(state)
+                    cls._completed_simulations.discard(simulation_id)
+                    logger.info(
+                        f"仿真进程已退出，保留既有终态: "
+                        f"simulation_id={simulation_id}"
+                    )
+
+                elif state.runner_status not in {
                     RunnerStatus.STOPPED,
                     RunnerStatus.FAILED,
                 }:
@@ -762,7 +795,9 @@ class SimulationRunner:
                 except Exception:
                     pass
                 cls._stderr_files.pop(simulation_id, None)
-    
+
+            cls._completed_simulations.discard(simulation_id)
+
     @classmethod
     def _read_action_log(
         cls, 
@@ -818,14 +853,12 @@ class SimulationRunner:
                                     # 如果运行了两个平台，需要两个都完成
                                     all_completed = cls._check_all_platforms_completed(state)
                                     if all_completed:
-                                        # Platform completion is only an input
-                                        # signal. The monitor publishes the
-                                        # terminal status after the process has
-                                        # exited and Zep ingestion has drained.
-                                        logger.info(
-                                            f"所有平台已结束，等待进程与图谱写入完成: "
-                                            f"{state.simulation_id}"
-                                        )
+                                        # 所有平台都已产出 simulation_end。此时仿真该做的
+                                        # 事已经做完了：不能等进程退出再发终态，因为进程会
+                                        # 进入等待命令模式常驻（用于采访 Agent），
+                                        # while process.poll() is None 永远不会结束。
+                                        # 先发布终态让报告接口放行，同时保留环境存活。
+                                        cls._publish_completion(state)
                                 
                                 # 更新轮次信息（从 round_end 事件）
                                 elif event_type == "round_end":
@@ -877,7 +910,75 @@ class SimulationRunner:
         except Exception as e:
             logger.warning(f"读取动作日志失败: {log_path}, error={e}")
             return position
-    
+
+    @classmethod
+    def _publish_completion(cls, state: SimulationRunState) -> None:
+        """
+        所有平台完成后发布终态（幂等）。
+
+        为什么不能等进程退出再发终态：
+        仿真脚本跑完会进入「等待命令模式」常驻，以便事后采访 Agent。
+        监控线程的 while process.poll() is None 因此永不结束，
+        runner_status 会一直停在 RUNNING，报告接口被 409 永久拦截。
+
+        这里在平台完成的第一时间发布 COMPLETED，同时保留进程存活：
+          - runner_status = COMPLETED  -> 报告接口放行
+          - env_alive = True           -> 采访接口继续可用
+
+        注意：必须修改 monitor 持有的内存 state 对象，
+        因为监控循环每 2 秒会用该对象覆写 run_state.json。
+        """
+        if state.runner_status != RunnerStatus.RUNNING:
+            # 已发布过终态（幂等），或已被人工停止/判定失败
+            return
+
+        simulation_id = state.simulation_id
+        logger.info(f"所有平台已完成，发布终态: simulation_id={simulation_id}")
+
+        # 1. 若有 Zep 记忆写入，先走 STOPPING 屏障排空队列。
+        #    报告接口会检查 updater 是否存在，未排空则仍返回 409。
+        if cls._graph_memory_enabled.get(simulation_id, False):
+            state.runner_status = RunnerStatus.STOPPING
+            cls._save_run_state(state)
+            cls._sync_simulation_status(simulation_id, RunnerStatus.STOPPING)
+            try:
+                ZepGraphMemoryManager.stop_updater(simulation_id)
+                cls._graph_memory_enabled.pop(simulation_id, None)
+                logger.info(f"图谱记忆已排空: simulation_id={simulation_id}")
+            except Exception as error:
+                # 排空失败不能挂死监控循环，降级为 FAILED 并记录原因。
+                logger.error(f"停止图谱记忆更新器失败: {error}")
+                state.runner_status = RunnerStatus.FAILED
+                state.error = f"Zep图谱写入未完整完成: {error}"
+                state.twitter_running = False
+                state.reddit_running = False
+                state.env_alive = False
+                state.completed_at = datetime.now().isoformat()
+                cls._save_run_state(state)
+                cls._sync_simulation_status(
+                    simulation_id, RunnerStatus.FAILED, state.error,
+                )
+                return
+
+        # 2. 发布 COMPLETED，环境保持存活以支持采访
+        state.runner_status = RunnerStatus.COMPLETED
+        state.twitter_running = False
+        state.reddit_running = False
+        state.completed_at = datetime.now().isoformat()
+        state.env_alive = True
+        state.error = None
+
+        # 立即停掉监控循环，避免它继续覆写状态。
+        # 进程本身不杀，采访能力保留。
+        cls._completed_simulations.add(simulation_id)
+
+        cls._save_run_state(state)
+        cls._sync_simulation_status(simulation_id, RunnerStatus.COMPLETED)
+        logger.info(
+            f"仿真已完成，环境保持存活以支持采访: "
+            f"simulation_id={simulation_id}"
+        )
+
     @classmethod
     def _check_all_platforms_completed(cls, state: SimulationRunState) -> bool:
         """

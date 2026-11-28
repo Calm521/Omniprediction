@@ -55,9 +55,15 @@ def test_manual_stop_surfaces_graph_ingestion_failure(monkeypatch):
         SimulationRunner._manual_stop_requests.discard("sim-1")
 
 
-def test_platform_completion_does_not_publish_terminal_success_before_barrier(
+def test_platform_completion_publishes_terminal_success_after_barrier_drains(
     monkeypatch, tmp_path
 ):
+    """平台全部完成后应立即发布终态，而不是等进程退出。
+
+    旧实现要求进程退出才发终态，但仿真脚本跑完会进入等待命令模式常驻，
+    导致状态永远停在 RUNNING、报告接口被 409 永久拦截。
+    现契约：平台完成后同步排空 Zep 写入并发布 COMPLETED，同时保留环境存活。
+    """
     simulation_id = "sim-1"
     sim_dir = tmp_path / simulation_id / "twitter"
     sim_dir.mkdir(parents=True)
@@ -67,16 +73,130 @@ def test_platform_completion_does_not_publish_terminal_success_before_barrier(
         encoding="utf-8",
     )
     monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        SimulationRunner,
+        "_save_run_state",
+        classmethod(lambda _cls, _state: None),
+    )
+    monkeypatch.setattr(
+        SimulationRunner,
+        "_sync_simulation_status",
+        classmethod(lambda _cls, *_args, **_kwargs: None),
+    )
+    # 无图谱写入时不应存在屏障，直接发布终态
+    SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
+    SimulationRunner._completed_simulations.discard(simulation_id)
+
     state = SimulationRunState(
         simulation_id=simulation_id,
         runner_status=RunnerStatus.RUNNING,
         twitter_running=True,
     )
 
-    SimulationRunner._read_action_log(str(log_path), 0, state, "twitter")
+    try:
+        SimulationRunner._read_action_log(str(log_path), 0, state, "twitter")
 
-    assert state.twitter_completed is True
-    assert state.runner_status == RunnerStatus.RUNNING
+        assert state.twitter_completed is True
+        assert state.runner_status == RunnerStatus.COMPLETED
+        assert state.completed_at is not None
+        # 进程仍在等待命令模式，采访能力保留
+        assert state.env_alive is True
+    finally:
+        SimulationRunner._completed_simulations.discard(simulation_id)
+
+
+def test_platform_completion_drains_graph_memory_before_publishing(monkeypatch, tmp_path):
+    """启用图谱记忆时，必须先排空 Zep 写入再发布 COMPLETED。"""
+    simulation_id = "sim-barrier"
+    sim_dir = tmp_path / simulation_id / "twitter"
+    sim_dir.mkdir(parents=True)
+    log_path = sim_dir / "actions.jsonl"
+    log_path.write_text(
+        '{"event_type":"simulation_end","total_rounds":1,"total_actions":0}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        SimulationRunner,
+        "_save_run_state",
+        classmethod(lambda _cls, _state: None),
+    )
+    monkeypatch.setattr(
+        SimulationRunner,
+        "_sync_simulation_status",
+        classmethod(lambda _cls, *_args, **_kwargs: None),
+    )
+    drained = []
+    monkeypatch.setattr(
+        runner_module.ZepGraphMemoryManager,
+        "stop_updater",
+        classmethod(lambda _cls, sim_id: drained.append(sim_id)),
+    )
+    SimulationRunner._graph_memory_enabled[simulation_id] = True
+    SimulationRunner._completed_simulations.discard(simulation_id)
+
+    state = SimulationRunState(
+        simulation_id=simulation_id,
+        runner_status=RunnerStatus.RUNNING,
+        twitter_running=True,
+    )
+
+    try:
+        SimulationRunner._read_action_log(str(log_path), 0, state, "twitter")
+
+        assert drained == [simulation_id], "必须排空 Zep 写入"
+        assert state.runner_status == RunnerStatus.COMPLETED
+        assert SimulationRunner._graph_memory_enabled.get(simulation_id) is None
+    finally:
+        SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
+        SimulationRunner._completed_simulations.discard(simulation_id)
+
+
+def test_barrier_drain_failure_marks_failed_not_completed(monkeypatch, tmp_path):
+    """排空失败必须降级为 FAILED，不能假装完成。"""
+    simulation_id = "sim-barrier-fail"
+    sim_dir = tmp_path / simulation_id / "twitter"
+    sim_dir.mkdir(parents=True)
+    log_path = sim_dir / "actions.jsonl"
+    log_path.write_text(
+        '{"event_type":"simulation_end","total_rounds":1,"total_actions":0}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        SimulationRunner,
+        "_save_run_state",
+        classmethod(lambda _cls, _state: None),
+    )
+    monkeypatch.setattr(
+        SimulationRunner,
+        "_sync_simulation_status",
+        classmethod(lambda _cls, *_args, **_kwargs: None),
+    )
+    monkeypatch.setattr(
+        runner_module.ZepGraphMemoryManager,
+        "stop_updater",
+        classmethod(
+            lambda _cls, _sim_id: (_ for _ in ()).throw(RuntimeError("drain broken"))
+        ),
+    )
+    SimulationRunner._graph_memory_enabled[simulation_id] = True
+    SimulationRunner._completed_simulations.discard(simulation_id)
+
+    state = SimulationRunState(
+        simulation_id=simulation_id,
+        runner_status=RunnerStatus.RUNNING,
+        twitter_running=True,
+    )
+
+    try:
+        SimulationRunner._read_action_log(str(log_path), 0, state, "twitter")
+
+        assert state.runner_status == RunnerStatus.FAILED
+        assert "drain broken" in state.error
+    finally:
+        SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
+        SimulationRunner._completed_simulations.discard(simulation_id)
 
 
 def test_manual_stop_timeout_leaves_monitor_owned_state_stopping(monkeypatch):

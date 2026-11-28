@@ -31,16 +31,16 @@ Omniprediction 致力于打造映射现实的群体智能镜像，通过捕捉�
 <div align="center">
 <table>
 <tr>
-<td><img src="./static/image/Screenshot/运行截图1.png" alt="截图1" width="100%"/></td>
-<td><img src="./static/image/Screenshot/运行截图2.png" alt="截图2" width="100%"/></td>
+<td><img src="./static/image/Screenshot/运行截图1.webp" alt="截图1" width="100%"/></td>
+<td><img src="./static/image/Screenshot/运行截图2.webp" alt="截图2" width="100%"/></td>
 </tr>
 <tr>
-<td><img src="./static/image/Screenshot/运行截图3.png" alt="截图3" width="100%"/></td>
-<td><img src="./static/image/Screenshot/运行截图4.png" alt="截图4" width="100%"/></td>
+<td><img src="./static/image/Screenshot/运行截图3.webp" alt="截图3" width="100%"/></td>
+<td><img src="./static/image/Screenshot/运行截图4.webp" alt="截图4" width="100%"/></td>
 </tr>
 <tr>
-<td><img src="./static/image/Screenshot/运行截图5.png" alt="截图5" width="100%"/></td>
-<td><img src="./static/image/Screenshot/运行截图6.png" alt="截图6" width="100%"/></td>
+<td><img src="./static/image/Screenshot/运行截图5.webp" alt="截图5" width="100%"/></td>
+<td><img src="./static/image/Screenshot/运行截图6.webp" alt="截图6" width="100%"/></td>
 </tr>
 </table>
 </div>
