@@ -244,6 +244,8 @@ class SimulationRunner:
     _manual_stop_requests: set[str] = set()
     # 已发布终态的仿真：监控循环据此停止覆写状态字段
     _completed_simulations: set[str] = set()
+    # 用户主动暂停的仿真：进程与数据库保持存活，仅在轮次边界挂起
+    _paused_simulations: set[str] = set()
 
     @classmethod
     def _finalization_lock(cls, simulation_id: str) -> threading.Lock:
@@ -1063,6 +1065,78 @@ class SimulationRunner:
                 process.wait(timeout=5)
     
     @classmethod
+    def _pause_flag_path(cls, simulation_id: str) -> str:
+        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+        return os.path.join(sim_dir, "pause.flag")
+
+    @classmethod
+    def pause_simulation(cls, simulation_id: str) -> SimulationRunState:
+        """在轮次边界暂停模拟。
+
+        不终止进程、不关闭数据库：子进程在下一轮开始前检查 pause.flag 并挂起。
+        因此这里的"继续"可以从当前轮次无缝恢复，不会重复已发生的社交互动。
+        """
+        state = cls.get_run_state(simulation_id)
+        if not state:
+            raise ValueError(f"模拟不存在: {simulation_id}")
+        if state.runner_status == RunnerStatus.PAUSED:
+            return state
+        if state.runner_status != RunnerStatus.RUNNING:
+            raise ValueError(
+                f"模拟未在运行中，无法暂停: {simulation_id}, status={state.runner_status}"
+            )
+
+        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+        if not os.path.isdir(sim_dir):
+            raise ValueError(f"模拟目录不存在: {simulation_id}")
+        with open(cls._pause_flag_path(simulation_id), 'w', encoding='utf-8') as f:
+            f.write(datetime.now().isoformat())
+
+        with cls._finalization_lock(simulation_id):
+            state.runner_status = RunnerStatus.PAUSED
+            cls._paused_simulations.add(simulation_id)
+            cls._save_run_state(state)
+            cls._sync_simulation_status(simulation_id, RunnerStatus.PAUSED)
+
+        logger.info(f"模拟已请求暂停: {simulation_id}")
+        return state
+
+    @classmethod
+    def resume_simulation(cls, simulation_id: str) -> SimulationRunState:
+        """继续已暂停的模拟：删除 pause.flag，子进程从下一轮继续。"""
+        state = cls.get_run_state(simulation_id)
+        if not state:
+            raise ValueError(f"模拟不存在: {simulation_id}")
+        if state.runner_status == RunnerStatus.RUNNING:
+            return state
+        if state.runner_status != RunnerStatus.PAUSED:
+            raise ValueError(
+                f"模拟未处于暂停状态，无法继续: {simulation_id}, status={state.runner_status}"
+            )
+
+        process = cls._processes.get(simulation_id)
+        if process is None or process.poll() is not None:
+            raise ValueError(
+                f"模拟进程已退出，无法继续；请重新启动模拟 (会从已完成轮次续跑): {simulation_id}"
+            )
+
+        flag = cls._pause_flag_path(simulation_id)
+        try:
+            if os.path.exists(flag):
+                os.remove(flag)
+        except OSError as e:
+            raise RuntimeError(f"删除暂停标志失败: {e}") from e
+
+        with cls._finalization_lock(simulation_id):
+            state.runner_status = RunnerStatus.RUNNING
+            cls._paused_simulations.discard(simulation_id)
+            cls._save_run_state(state)
+            cls._sync_simulation_status(simulation_id, RunnerStatus.RUNNING)
+
+        logger.info(f"模拟已继续: {simulation_id}")
+        return state
+
+    @classmethod
     def stop_simulation(cls, simulation_id: str) -> SimulationRunState:
         """停止模拟"""
         with cls._finalization_lock(simulation_id):
@@ -1095,6 +1169,14 @@ class SimulationRunner:
 
             state.runner_status = RunnerStatus.STOPPING
             cls._manual_stop_requests.add(simulation_id)
+            # 停止优先于暂停：清掉 pause.flag，否则重启的进程会在第一轮就挂起
+            cls._paused_simulations.discard(simulation_id)
+            try:
+                flag = cls._pause_flag_path(simulation_id)
+                if os.path.exists(flag):
+                    os.remove(flag)
+            except OSError:
+                pass
             cls._save_run_state(state)
             cls._sync_simulation_status(simulation_id, RunnerStatus.STOPPING)
 

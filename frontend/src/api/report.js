@@ -49,3 +49,27 @@ export const getReport = (reportId) => {
 export const chatWithReport = (data) => {
   return service.post('/api/report/chat', data)
 }
+
+/**
+ * 暂停报告生成（已完成章节保留）
+ * @param {Object} data - { simulation_id }
+ */
+export const pauseReport = (data) => {
+  return service.post('/api/report/pause', data)
+}
+
+/**
+ * 继续已暂停的报告生成
+ * @param {Object} data - { simulation_id }
+ */
+export const resumeReport = (data) => {
+  return service.post('/api/report/resume', data)
+}
+
+/**
+ * 查询报告生成作业状态（paused/running/idle）
+ * @param {Object} data - { simulation_id }
+ */
+export const getReportJob = (data) => {
+  return service.post('/api/report/job', data)
+}

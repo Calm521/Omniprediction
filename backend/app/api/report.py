@@ -14,6 +14,13 @@ from ..services.report_agent import ReportAgent, ReportManager, ReportStatus
 from ..services.simulation_manager import SimulationManager
 from ..services.simulation_runner import SimulationRunner, RunnerStatus
 from ..services.zep_graph_memory_updater import ZepGraphMemoryManager
+from ..services.job_control import (
+    JobCancelled,
+    JobControl,
+    JobPhase,
+    JobState,
+    JobStateStore,
+)
 from ..models.project import ProjectManager, ProjectStatus
 from ..models.task import TaskManager, TaskStatus
 from ..utils.logger import get_logger
@@ -242,6 +249,16 @@ def generate_report():
             current_locale = get_locale()
             register_graph_reader(graph_id, report_id)
 
+            # 报告作业的暂停控制：按 simulation_id 复用信号
+            report_key = JobControl.make_key(JobPhase.REPORT, simulation_id)
+            report_signal = JobControl().get_or_create(report_key)
+            report_signal.resume()
+            JobStateStore.save(
+                JobPhase.REPORT, simulation_id, JobState.RUNNING,
+                progress=0, message=t('api.initReportAgent'), resumable=True,
+                extra={"report_id": report_id},
+            )
+
             def run_generate():
                 set_locale(current_locale)
                 try:
@@ -251,6 +268,7 @@ def generate_report():
                         progress=0,
                         message=t('api.initReportAgent')
                     )
+                    report_signal.checkpoint()
 
                     agent = ReportAgent(
                         graph_id=graph_id,
@@ -267,7 +285,8 @@ def generate_report():
 
                     report = agent.generate_report(
                         progress_callback=progress_callback,
-                        report_id=report_id
+                        report_id=report_id,
+                        pause_signal=report_signal,
                     )
                     ReportManager.save_report(report)
 
@@ -280,15 +299,34 @@ def generate_report():
                                 "status": "completed"
                             }
                         )
+                        JobStateStore.save(
+                            JobPhase.REPORT, simulation_id, JobState.COMPLETED,
+                            progress=100, message=t('progress.reportComplete'), resumable=False,
+                            extra={"report_id": report.report_id},
+                        )
                     else:
                         task_manager.fail_task(
                             task_id,
                             report.error or t('api.reportGenerateFailed')
                         )
+                except JobCancelled:
+                    logger.info(f"报告生成被用户暂停/停止: {simulation_id}")
+                    task_manager.fail_task(task_id, t('api.reportPaused'))
+                    JobStateStore.save(
+                        JobPhase.REPORT, simulation_id, JobState.PAUSED,
+                        progress=20, message=t('api.reportPaused'), resumable=True,
+                        extra={"report_id": report_id},
+                    )
                 except Exception as e:
                     logger.error(f"报告生成失败: {str(e)}")
                     task_manager.fail_task(task_id, str(e))
+                    JobStateStore.save(
+                        JobPhase.REPORT, simulation_id, JobState.FAILED,
+                        progress=0, message=str(e), resumable=True,
+                        extra={"report_id": report_id},
+                    )
                 finally:
+                    JobControl().drop(report_key)
                     unregister_graph_reader(graph_id, report_id)
 
             try:
@@ -317,6 +355,72 @@ def generate_report():
             "error": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
+
+@report_bp.route('/pause', methods=['POST'])
+def pause_report():
+    """暂停报告生成（已完成章节保留）。"""
+    try:
+        data = request.get_json() or {}
+        simulation_id = data.get('simulation_id')
+        if not simulation_id:
+            return jsonify({
+                "success": False,
+                "error": t('api.requireSimulationId')
+            }), 400
+
+        key = JobControl.make_key(JobPhase.REPORT, simulation_id)
+        signal = JobControl().get(key)
+        if signal is None:
+            return jsonify({
+                "success": False,
+                "error": t('api.reportNotRunning')
+            }), 400
+
+        signal.pause()
+        JobStateStore.save(
+            JobPhase.REPORT, simulation_id, JobState.PAUSED,
+            progress=20, message=t('api.reportPaused'), resumable=True,
+        )
+        return jsonify({
+            "success": True,
+            "data": {"simulation_id": simulation_id, "state": JobState.PAUSED.value}
+        })
+    except Exception as e:
+        logger.error(f"暂停报告生成失败: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@report_bp.route('/resume', methods=['POST'])
+def resume_report():
+    """继续已暂停的报告生成；作业已退出则重新发起 generate（跳过已完成章节）。"""
+    try:
+        data = request.get_json() or {}
+        simulation_id = data.get('simulation_id')
+        if not simulation_id:
+            return jsonify({
+                "success": False,
+                "error": t('api.requireSimulationId')
+            }), 400
+
+        key = JobControl.make_key(JobPhase.REPORT, simulation_id)
+        signal = JobControl().get(key)
+        if signal is not None and signal.is_paused:
+            signal.resume()
+            JobStateStore.save(
+                JobPhase.REPORT, simulation_id, JobState.RUNNING,
+                progress=20, message=t('progress.generatingSection'), resumable=True,
+            )
+            return jsonify({
+                "success": True,
+                "data": {"simulation_id": simulation_id, "state": JobState.RUNNING.value}
+            })
+
+        logger.info(f"报告作业不在运行，重新发起: {simulation_id}")
+        return generate_report()
+    except Exception as e:
+        logger.error(f"继续报告生成失败: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @report_bp.route('/generate/status', methods=['POST'])
@@ -392,6 +496,41 @@ def get_generate_status():
 
 
 # ============== 报告获取接口 ==============
+
+@report_bp.route('/job', methods=['POST'])
+def get_report_job():
+    """查询报告生成作业的暂停状态（页面重开后恢复控制关系）。"""
+    try:
+        data = request.get_json() or {}
+        simulation_id = data.get('simulation_id')
+        if not simulation_id:
+            return jsonify({
+                "success": False,
+                "error": t('api.requireSimulationId')
+            }), 400
+
+        stored = JobStateStore.load(JobPhase.REPORT, simulation_id)
+        signal = JobControl().get(JobControl.make_key(JobPhase.REPORT, simulation_id))
+
+        state = (stored or {}).get("state", "idle")
+        if signal is not None:
+            state = "paused" if signal.is_paused else "running"
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "simulation_id": simulation_id,
+                "state": state,
+                "progress": (stored or {}).get("progress", 0),
+                "message": (stored or {}).get("message", ""),
+                "resumable": (stored or {}).get("resumable", True),
+                "report_id": (stored or {}).get("extra", {}).get("report_id"),
+            }
+        })
+    except Exception as e:
+        logger.error(f"查询报告作业状态失败: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @report_bp.route('/<report_id>', methods=['GET'])
 def get_report(report_id: str):

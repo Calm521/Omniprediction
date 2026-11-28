@@ -19,6 +19,13 @@ from ..services.simulation_runner import (
     SimulationStopPending,
 )
 from ..services.zep_graph_memory_updater import ZepGraphMemoryManager
+from ..services.job_control import (
+    JobCancelled,
+    JobControl,
+    JobPhase,
+    JobState,
+    JobStateStore,
+)
 from ..utils.logger import get_logger
 from ..utils.locale import t, get_locale, set_locale
 from ..utils.zep_lifecycle import get_graph_readers, graph_lifecycle_lock
@@ -534,6 +541,15 @@ def prepare_simulation():
         # Capture locale before spawning background thread
         current_locale = get_locale()
 
+        # 准备作业的暂停控制：按 simulation_id 复用信号
+        prepare_key = JobControl.make_key(JobPhase.SIMULATION_PREPARE, simulation_id)
+        prepare_signal = JobControl().get_or_create(prepare_key)
+        prepare_signal.resume()
+        JobStateStore.save(
+            JobPhase.SIMULATION_PREPARE, simulation_id, JobState.RUNNING,
+            progress=0, message=t('progress.startPreparingEnv'), resumable=True,
+        )
+
         # 定义后台任务
         def run_prepare():
             set_locale(current_locale)
@@ -544,6 +560,7 @@ def prepare_simulation():
                     progress=0,
                     message=t('progress.startPreparingEnv')
                 )
+                prepare_signal.checkpoint()
                 
                 # 准备模拟（带进度回调）
                 # 存储阶段进度详情
@@ -617,7 +634,8 @@ def prepare_simulation():
                     defined_entity_types=entity_types_list,
                     use_llm_for_profiles=use_llm_for_profiles,
                     progress_callback=progress_callback,
-                    parallel_profile_count=parallel_profile_count
+                    parallel_profile_count=parallel_profile_count,
+                    pause_signal=prepare_signal,
                 )
 
                 if result_state.status == SimulationStatus.FAILED:
@@ -631,17 +649,47 @@ def prepare_simulation():
                         result=result_state.to_simple_dict()
                     )
                 
+                JobStateStore.save(
+                    JobPhase.SIMULATION_PREPARE, simulation_id, JobState.COMPLETED,
+                    progress=100, message=t('progress.prepareComplete'), resumable=False,
+                )
+                JobControl().drop(prepare_key)
+
+            except JobCancelled:
+                logger.info(f"模拟准备被用户暂停/停止: {simulation_id}")
+                task_manager.fail_task(task_id, t('api.preparePaused'))
+                state = manager.get_simulation(simulation_id)
+                if state:
+                    # 保留已生成的人设文件，状态回到 PREPARING 以便续跑
+                    state.status = SimulationStatus.PREPARING
+                    state.error = None
+                    manager._save_simulation_state(state)
+                JobStateStore.save(
+                    JobPhase.SIMULATION_PREPARE, simulation_id, JobState.PAUSED,
+                    progress=state.profiles_count > 0 and 70 or 20,
+                    message=t('api.preparePaused'),
+                    resumable=True,
+                    extra={"profiles_count": state.profiles_count if state else 0},
+                )
+                JobControl().drop(prepare_key)
+
             except Exception as e:
                 logger.error(f"准备模拟失败: {str(e)}")
                 task_manager.fail_task(task_id, str(e))
-                
+
                 # 更新模拟状态为失败
                 state = manager.get_simulation(simulation_id)
                 if state:
                     state.status = SimulationStatus.FAILED
                     state.error = str(e)
                     manager._save_simulation_state(state)
-        
+
+                JobStateStore.save(
+                    JobPhase.SIMULATION_PREPARE, simulation_id, JobState.FAILED,
+                    progress=0, message=str(e), resumable=True,
+                )
+                JobControl().drop(prepare_key)
+
         # 启动后台线程
         thread = threading.Thread(target=run_prepare, daemon=True)
         thread.start()
@@ -672,6 +720,73 @@ def prepare_simulation():
             "error": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
+
+@simulation_bp.route('/prepare/pause', methods=['POST'])
+def pause_prepare():
+    """暂停环境准备（已生成的人设保留）。"""
+    try:
+        data = request.get_json() or {}
+        simulation_id = data.get('simulation_id')
+        if not simulation_id:
+            return jsonify({
+                "success": False,
+                "error": t('api.requireSimulationId')
+            }), 400
+
+        key = JobControl.make_key(JobPhase.SIMULATION_PREPARE, simulation_id)
+        signal = JobControl().get(key)
+        if signal is None:
+            return jsonify({
+                "success": False,
+                "error": t('api.prepareNotRunning')
+            }), 400
+
+        signal.pause()
+        JobStateStore.save(
+            JobPhase.SIMULATION_PREPARE, simulation_id, JobState.PAUSED,
+            progress=20, message=t('api.preparePaused'), resumable=True,
+        )
+        return jsonify({
+            "success": True,
+            "data": {"simulation_id": simulation_id, "state": JobState.PAUSED.value}
+        })
+    except Exception as e:
+        logger.error(f"暂停准备失败: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@simulation_bp.route('/prepare/resume', methods=['POST'])
+def resume_prepare():
+    """继续已暂停的环境准备；作业已退出则重新发起 prepare。"""
+    try:
+        data = request.get_json() or {}
+        simulation_id = data.get('simulation_id')
+        if not simulation_id:
+            return jsonify({
+                "success": False,
+                "error": t('api.requireSimulationId')
+            }), 400
+
+        key = JobControl.make_key(JobPhase.SIMULATION_PREPARE, simulation_id)
+        signal = JobControl().get(key)
+        if signal is not None and signal.is_paused:
+            signal.resume()
+            JobStateStore.save(
+                JobPhase.SIMULATION_PREPARE, simulation_id, JobState.RUNNING,
+                progress=20, message=t('progress.generatingProfiles'), resumable=True,
+            )
+            return jsonify({
+                "success": True,
+                "data": {"simulation_id": simulation_id, "state": JobState.RUNNING.value}
+            })
+
+        # 作业线程已不存在：重新发起准备（已存在的人设文件会被复用校验）
+        logger.info(f"准备作业不在运行，重新发起: {simulation_id}")
+        return prepare_simulation()
+    except Exception as e:
+        logger.error(f"继续准备失败: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @simulation_bp.route('/prepare/status', methods=['POST'])
@@ -723,6 +838,25 @@ def get_prepare_status():
                         "message": t('api.alreadyPrepared'),
                         "already_prepared": True,
                         "prepare_info": prepare_info
+                    }
+                })
+
+            # 暂停中：明确告知前端，避免把暂停误判为失败
+            prepare_key = JobControl.make_key(JobPhase.SIMULATION_PREPARE, simulation_id)
+            prepare_signal = JobControl().get(prepare_key)
+            if prepare_signal is not None and prepare_signal.is_paused:
+                stored = JobStateStore.load(JobPhase.SIMULATION_PREPARE, simulation_id) or {}
+                return jsonify({
+                    "success": True,
+                    "data": {
+                        "simulation_id": simulation_id,
+                        "task_id": task_id,
+                        "status": "paused",
+                        "progress": stored.get("progress", 20),
+                        "message": t('api.preparePaused'),
+                        "already_prepared": False,
+                        "job_state": "paused",
+                        "resumable": True,
                     }
                 })
         
@@ -1778,6 +1912,70 @@ def start_simulation():
         
     except Exception as e:
         logger.error(f"启动模拟失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/pause', methods=['POST'])
+def pause_simulation():
+    """
+    暂停模拟（不终止进程，保留数据库）
+
+    请求（JSON）：
+        {"simulation_id": "sim_xxxx"}
+
+    子进程在下一轮开始前挂起，恢复时从当前轮次无缝继续。
+    """
+    try:
+        data = request.get_json() or {}
+        simulation_id = data.get('simulation_id')
+        if not simulation_id:
+            return jsonify({
+                "success": False,
+                "error": t('api.requireSimulationId')
+            }), 400
+
+        state = SimulationRunner.pause_simulation(simulation_id)
+        return jsonify({"success": True, "data": state.to_dict()})
+
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"暂停模拟失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/resume', methods=['POST'])
+def resume_simulation():
+    """
+    继续已暂停的模拟
+
+    请求（JSON）：
+        {"simulation_id": "sim_xxxx"}
+    """
+    try:
+        data = request.get_json() or {}
+        simulation_id = data.get('simulation_id')
+        if not simulation_id:
+            return jsonify({
+                "success": False,
+                "error": t('api.requireSimulationId')
+            }), 400
+
+        state = SimulationRunner.resume_simulation(simulation_id)
+        return jsonify({"success": True, "data": state.to_dict()})
+
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"继续模拟失败: {str(e)}")
         return jsonify({
             "success": False,
             "error": str(e),

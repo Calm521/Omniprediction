@@ -19,6 +19,7 @@ from openai import OpenAI
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, get_locale, set_locale, t
+from .job_control import JobCancelled
 from ..utils.openai_chat_compat import create_chat_completion, extract_chat_completion_text
 from ..utils.zep import (
     call_zep_read_with_retry,
@@ -200,6 +201,33 @@ class OasisAgentProfile:
             "source_entity_type": self.source_entity_type,
             "created_at": self.created_at,
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "OasisAgentProfile":
+        """从 to_reddit_format / to_dict 产生的字典重建。
+
+        只取已知字段，兼容旧文件里可能缺失或多出的键。
+        """
+        return cls(
+            user_id=int(data.get("user_id", 0)),
+            user_name=_coerce_to_str(data.get("user_name") or data.get("username")) or "",
+            name=_coerce_to_str(data.get("name")) or "",
+            bio=_coerce_to_str(data.get("bio")) or "",
+            persona=_coerce_to_str(data.get("persona")) or "",
+            karma=int(data.get("karma") or 1000),
+            friend_count=int(data.get("friend_count") or 100),
+            follower_count=int(data.get("follower_count") or 150),
+            statuses_count=int(data.get("statuses_count") or 500),
+            age=data.get("age"),
+            gender=data.get("gender"),
+            mbti=data.get("mbti"),
+            country=data.get("country"),
+            profession=data.get("profession"),
+            interested_topics=data.get("interested_topics") or [],
+            source_entity_uuid=data.get("source_entity_uuid"),
+            source_entity_type=data.get("source_entity_type"),
+            created_at=_coerce_to_str(data.get("created_at")) or datetime.now().strftime("%Y-%m-%d"),
+        )
 
 
 class OasisProfileGenerator:
@@ -900,11 +928,13 @@ class OasisProfileGenerator:
         graph_id: Optional[str] = None,
         parallel_count: int = 5,
         realtime_output_path: Optional[str] = None,
-        output_platform: str = "reddit"
+        output_platform: str = "reddit",
+        pause_signal=None,
+        existing_profiles: Optional[List[dict]] = None,
     ) -> List[OasisAgentProfile]:
         """
         批量从实体生成Agent Profile（支持并行生成）
-        
+
         Args:
             entities: 实体列表
             use_llm: 是否使用LLM生成详细人设
@@ -913,21 +943,46 @@ class OasisProfileGenerator:
             parallel_count: 并行生成数量，默认5
             realtime_output_path: 实时写入的文件路径（如果提供，每生成一个就写入一次）
             output_platform: 输出平台格式 ("reddit" 或 "twitter")
-            
+            pause_signal: 可选，暂停信号；在提交每个任务前检查点
+            existing_profiles: 可选，上一轮已生成的人设（按 user_id 复用，避免重复调用 LLM）
+
         Returns:
             Agent Profile列表
         """
         import concurrent.futures
         from threading import Lock
-        
+
         # 设置graph_id用于Zep检索
         if graph_id:
             self.graph_id = graph_id
-        
+
         total = len(entities)
         profiles = [None] * total  # 预分配列表保持顺序
         completed_count = [0]  # 使用列表以便在闭包中修改
         lock = Lock()
+
+        # 复用上一轮已生成的人设：按 user_id 对齐
+        reused_by_index: dict[int, OasisAgentProfile] = {}
+        if existing_profiles:
+            for item in existing_profiles:
+                try:
+                    uid = int(item.get("user_id"))
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= uid < total:
+                    reused_by_index[uid] = OasisAgentProfile.from_dict(item)
+            for idx, profile in reused_by_index.items():
+                profiles[idx] = profile
+            completed_count[0] = len(reused_by_index)
+            logger.info(
+                f"续跑：复用已有 {len(reused_by_index)}/{total} 个Agent人设，"
+                f"仅生成剩余 {total - len(reused_by_index)} 个"
+            )
+            if progress_callback and reused_by_index:
+                progress_callback(
+                    completed_count[0], total,
+                    f"已复用 {len(reused_by_index)} 个已有Agent人设"
+                )
         
         # 实时写入文件的辅助函数
         def save_profiles_realtime():
@@ -1000,29 +1055,50 @@ class OasisProfileGenerator:
         print(f"{'='*60}\n")
         
         # 使用线程池并行执行
+        pending_entities = [
+            (idx, entity) for idx, entity in enumerate(entities)
+            if idx not in reused_by_index
+        ]
+        if not pending_entities:
+            logger.info("所有Agent人设均已复用，跳过LLM生成")
+            return profiles
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_count) as executor:
-            # 提交所有任务
-            future_to_entity = {
-                executor.submit(generate_single_profile, idx, entity): (idx, entity)
-                for idx, entity in enumerate(entities)
-            }
-            
+            # 提交任务；每提交一个前先过暂停检查点，暂停时不再发起新的 LLM 调用
+            future_to_entity = {}
+            for idx, entity in pending_entities:
+                if pause_signal is not None:
+                    try:
+                        pause_signal.checkpoint()
+                    except JobCancelled:
+                        # 取消：停止提交剩余任务，已完成的部分已实时落盘，
+                        # 向上抛出让上层落到 PAUSED 态，避免半成品被当作完整人设保存
+                        logger.info(f"人设生成被取消，已完成 {completed_count[0]}/{total}")
+                        for f in future_to_entity:
+                            f.cancel()
+                        raise
+                future = executor.submit(generate_single_profile, idx, entity)
+                future_to_entity[future] = (idx, entity)
+
             # 收集结果
             for future in concurrent.futures.as_completed(future_to_entity):
                 idx, entity = future_to_entity[future]
                 entity_type = entity.get_entity_type() or "Entity"
-                
+
                 try:
                     result_idx, profile, error = future.result()
                     profiles[result_idx] = profile
-                    
+
                     with lock:
                         completed_count[0] += 1
                         current = completed_count[0]
-                    
+
                     # 实时写入文件
                     save_profiles_realtime()
-                    
+
+                    if pause_signal is not None:
+                        pause_signal.checkpoint()
+
                     if progress_callback:
                         progress_callback(
                             current, 

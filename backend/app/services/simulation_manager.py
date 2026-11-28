@@ -17,6 +17,7 @@ from ..utils.logger import get_logger
 from .zep_entity_reader import ZepEntityReader, FilteredEntities
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
 from .simulation_config_generator import SimulationConfigGenerator, SimulationParameters
+from .job_control import JobCancelled
 from ..utils.locale import t
 
 logger = get_logger('omniprediction.simulation')
@@ -249,7 +250,8 @@ class SimulationManager:
         defined_entity_types: Optional[List[str]] = None,
         use_llm_for_profiles: bool = True,
         progress_callback: Optional[callable] = None,
-        parallel_profile_count: int = 3
+        parallel_profile_count: int = 3,
+        pause_signal=None,
     ) -> SimulationState:
         """
         准备模拟环境（全程自动化）
@@ -354,6 +356,22 @@ class SimulationManager:
                 realtime_output_path = os.path.join(sim_dir, "twitter_profiles.csv")
                 realtime_platform = "twitter"
             
+            # 续跑：读取上一次已落盘的人设，按 user_id 复用，避免重复消耗 LLM
+            existing_profiles_data = None
+            if state.enable_reddit:
+                existing_reddit = os.path.join(sim_dir, "reddit_profiles.json")
+                if os.path.exists(existing_reddit):
+                    try:
+                        with open(existing_reddit, 'r', encoding='utf-8') as f:
+                            existing_profiles_data = json.load(f)
+                        if existing_profiles_data:
+                            logger.info(
+                                f"检测到已有 {len(existing_profiles_data)} 个Reddit人设，将尝试复用"
+                            )
+                    except (json.JSONDecodeError, OSError) as e:
+                        logger.warning(f"读取已有Reddit人设失败，将重新生成: {e}")
+                        existing_profiles_data = None
+
             profiles = generator.generate_profiles_from_entities(
                 entities=filtered.entities,
                 use_llm=use_llm_for_profiles,
@@ -361,7 +379,9 @@ class SimulationManager:
                 graph_id=state.graph_id,  # 传入graph_id用于Zep检索
                 parallel_count=parallel_profile_count,  # 并行生成数量
                 realtime_output_path=realtime_output_path,  # 实时保存路径
-                output_platform=realtime_platform  # 输出格式
+                output_platform=realtime_platform,  # 输出格式
+                pause_signal=pause_signal,
+                existing_profiles=existing_profiles_data,
             )
             
             state.profiles_count = len(profiles)
@@ -466,7 +486,16 @@ class SimulationManager:
                        f"entities={state.entities_count}, profiles={state.profiles_count}")
             
             return state
-            
+
+        except JobCancelled:
+            # 用户暂停：保留已完成的人设文件，状态回到 PREPARING 以便续跑，
+            # 不标记 FAILED（否则前端会显示错误，且 _check_simulation_prepared 语义混乱）
+            logger.info(f"模拟准备被用户暂停: {simulation_id}")
+            state.status = SimulationStatus.PREPARING
+            state.error = None
+            self._save_simulation_state(state)
+            raise
+
         except Exception as e:
             logger.error(f"模拟准备失败: {simulation_id}, error={str(e)}")
             import traceback

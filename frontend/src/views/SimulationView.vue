@@ -22,6 +22,13 @@
 
       <div class="header-right">
         <LanguageSwitcher />
+        <JobToggleButton
+          v-if="jobToggleVisible"
+          :state="jobState"
+          :busy="jobBusy"
+          @pause="handlePausePrepare"
+          @resume="handleResumePrepare"
+        />
         <div class="step-divider"></div>
         <div class="workflow-step">
           <span class="step-num">Step 2/5</span>
@@ -71,8 +78,9 @@ import { useRoute, useRouter } from 'vue-router'
 import GraphPanel from '../components/GraphPanel.vue'
 import Step2EnvSetup from '../components/Step2EnvSetup.vue'
 import { getProject, getGraphData } from '../api/graph'
-import { getSimulation, stopSimulation, getEnvStatus, closeSimulationEnv } from '../api/simulation'
+import { getSimulation, stopSimulation, getEnvStatus, closeSimulationEnv, pausePrepare, resumePrepare } from '../api/simulation'
 import LanguageSwitcher from '../components/LanguageSwitcher.vue'
+import JobToggleButton from '../components/JobToggleButton.vue'
 import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
@@ -110,14 +118,58 @@ const rightPanelStyle = computed(() => {
 
 // --- Status Computed ---
 const statusClass = computed(() => {
+  if (jobState.value === 'paused') return 'paused'
   return currentStatus.value
 })
 
 const statusText = computed(() => {
+  if (jobState.value === 'paused') return t('common.paused')
   if (currentStatus.value === 'error') return 'Error'
   if (currentStatus.value === 'completed') return 'Ready'
   return 'Preparing'
 })
+
+// --- 暂停/继续（Step2 环境准备） ---
+const jobState = ref('idle') // idle | running | paused
+const jobBusy = ref(false)
+const jobToggleVisible = computed(
+  () => jobState.value === 'running' || jobState.value === 'paused'
+)
+
+const updateStatus = (status) => {
+  currentStatus.value = status
+  if (status === 'paused') {
+    jobState.value = 'paused'
+  } else if (status === 'preparing' || status === 'processing') {
+    if (jobState.value !== 'paused') jobState.value = 'running'
+  }
+}
+
+const handlePausePrepare = async () => {
+  if (jobBusy.value) return
+  jobBusy.value = true
+  try {
+    await pausePrepare({ simulation_id: currentSimulationId.value })
+    jobState.value = 'paused'
+  } catch (err) {
+    console.warn('Pause prepare failed:', err)
+  } finally {
+    jobBusy.value = false
+  }
+}
+
+const handleResumePrepare = async () => {
+  if (jobBusy.value) return
+  jobBusy.value = true
+  try {
+    await resumePrepare({ simulation_id: currentSimulationId.value })
+    jobState.value = 'running'
+  } catch (err) {
+    console.warn('Resume prepare failed:', err)
+  } finally {
+    jobBusy.value = false
+  }
+}
 
 // --- Helpers ---
 const addLog = (msg) => {
@@ -126,10 +178,6 @@ const addLog = (msg) => {
   if (systemLogs.value.length > 100) {
     systemLogs.value.shift()
   }
-}
-
-const updateStatus = (status) => {
-  currentStatus.value = status
 }
 
 // --- Layout Methods ---
@@ -414,6 +462,7 @@ onMounted(async () => {
 .status-indicator.processing .dot { background: #FF5722; animation: pulse 1s infinite; }
 .status-indicator.completed .dot { background: #4CAF50; }
 .status-indicator.error .dot { background: #F44336; }
+.status-indicator.paused .dot { background: #999; box-shadow: 0 0 0 3px rgba(0,0,0,0.08); }
 
 @keyframes pulse { 50% { opacity: 0.5; } }
 

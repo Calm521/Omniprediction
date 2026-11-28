@@ -23,7 +23,12 @@
     "minutes": "分钟",
     "rounds": "轮",
     "items": "个",
-    "files": "个文件"
+    "files": "个文件",
+    "pause": "暂停",
+    "resume": "继续",
+    "paused": "已暂停",
+    "pauseHint": "暂停当前流程，已完成的部分会保留",
+    "resumeHint": "从中断处继续执行"
   },
   "meta": {
     "title": "Omniprediction - 预测万物",
@@ -388,7 +393,13 @@
     "envRunning": "环境正在运行，可以接收Interview命令",
     "envNotRunningShort": "环境未运行或已关闭",
     "requireGraphIdAndQuery": "请提供 graph_id 和 query",
-    "initReportAgent": "初始化Report Agent..."
+    "initReportAgent": "初始化Report Agent...",
+    "graphBuildPaused": "图谱构建已暂停，可随时继续",
+    "graphNotBuilding": "当前没有正在进行的图谱构建",
+    "preparePaused": "环境搭建已暂停，已完成的人设会保留",
+    "reportPaused": "报告生成已暂停，已完成章节会保留",
+    "prepareNotRunning": "当前没有正在进行的环境准备",
+    "reportNotRunning": "当前没有正在生成的报告"
   },
   "progress": {
     "initGraphService": "初始化图谱构建服务...",
@@ -450,7 +461,9 @@
     "readingGraphEntities": "读取图谱实体",
     "generatingProfiles": "生成Agent人设",
     "generatingSimConfig": "生成模拟配置",
-    "preparingScripts": "准备模拟脚本"
+    "preparingScripts": "准备模拟脚本",
+    "prepareComplete": "环境准备完成",
+    "reportPaused": "报告生成已暂停，已完成章节已保留"
   },
   "log": {
     "preparingGoBack": "准备返回 Step 2，正在关闭模拟...",

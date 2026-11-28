@@ -23,12 +23,13 @@ from ..utils.llm_client import LLMClient
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, t
 from .zep_tools import (
-    ZepToolsService, 
-    SearchResult, 
-    InsightForgeResult, 
+    ZepToolsService,
+    SearchResult,
+    InsightForgeResult,
     PanoramaResult,
     InterviewResult
 )
+from .job_control import JobCancelled
 
 logger = get_logger('omniprediction.report_agent')
 
@@ -1574,13 +1575,14 @@ class ReportAgent:
         return final_answer
     
     def generate_report(
-        self, 
+        self,
         progress_callback: Optional[Callable[[str, int, str], None]] = None,
-        report_id: Optional[str] = None
+        report_id: Optional[str] = None,
+        pause_signal=None,
     ) -> Report:
         """
         生成完整报告（分章节实时输出）
-        
+
         每个章节生成完成后立即保存到文件夹，不需要等待整个报告完成。
         文件结构：
         reports/{report_id}/
@@ -1591,11 +1593,12 @@ class ReportAgent:
             section_02.md   - 第2章节
             ...
             full_report.md  - 完整报告
-        
+
         Args:
             progress_callback: 进度回调函数 (stage, progress, message)
             report_id: 报告ID（可选，如果不传则自动生成）
-            
+            pause_signal: 可选，暂停信号；章节之间检查点，已完成章节会保留并跳过
+
         Returns:
             Report: 完整报告
         """
@@ -1648,39 +1651,82 @@ class ReportAgent:
             
             # 记录规划开始日志
             self.report_logger.log_planning_start()
-            
+
             if progress_callback:
                 progress_callback("planning", 0, t('progress.startPlanningOutline'))
-            
-            outline = self.plan_outline(
-                progress_callback=lambda stage, prog, msg: 
-                    progress_callback(stage, prog // 5, msg) if progress_callback else None
-            )
+
+            # 续跑：若大纲已存在且已有章节落地，复用大纲跳过 LLM 规划
+            resumed_outline = ReportManager.load_outline(report_id)
+            already_generated = ReportManager.get_generated_sections(report_id)
+            if resumed_outline is not None and already_generated:
+                outline = resumed_outline
+                logger.info(
+                    f"续跑：复用报告大纲 {report_id}，已有 {len(already_generated)} 个章节"
+                )
+                if progress_callback:
+                    progress_callback(
+                        "planning", 15,
+                        t('progress.outlineDone', count=len(outline.sections))
+                    )
+            else:
+                outline = self.plan_outline(
+                    progress_callback=lambda stage, prog, msg:
+                        progress_callback(stage, prog // 5, msg) if progress_callback else None
+                )
+                # 记录规划完成日志
+                self.report_logger.log_planning_complete(outline.to_dict())
+                # 保存大纲到文件
+                ReportManager.save_outline(report_id, outline)
+
             report.outline = outline
-            
-            # 记录规划完成日志
-            self.report_logger.log_planning_complete(outline.to_dict())
-            
-            # 保存大纲到文件
-            ReportManager.save_outline(report_id, outline)
+
             ReportManager.update_progress(
                 report_id, "planning", 15, t('progress.outlineDone', count=len(outline.sections)),
                 completed_sections=[]
             )
             ReportManager.save_report(report)
-            
+
             logger.info(t('report.outlineSavedToFile', reportId=report_id))
             
             # 阶段2: 逐章节生成（分章节保存）
             report.status = ReportStatus.GENERATING
-            
+
             total_sections = len(outline.sections)
             generated_sections = []  # 保存内容用于上下文
-            
+
+            # 续跑：读取磁盘上已完成章节，跳过重新生成（保留上下文连贯性）
+            existing_sections = {
+                item["section_index"]: item["content"]
+                for item in ReportManager.get_generated_sections(report_id)
+            }
+            if existing_sections:
+                logger.info(
+                    f"续跑：报告 {report_id} 已有 {len(existing_sections)} 个章节，将跳过已完成部分"
+                )
+
             for i, section in enumerate(outline.sections):
                 section_num = i + 1
                 base_progress = 20 + int((i / total_sections) * 70)
-                
+
+                # 已完成章节：直接沿用，避免重复消耗 LLM 与丢失既有内容
+                if section_num in existing_sections:
+                    section.content = existing_sections[section_num]
+                    generated_sections.append(
+                        f"## {section.title}\n\n{existing_sections[section_num]}"
+                    )
+                    completed_section_titles.append(section.title)
+                    if progress_callback:
+                        progress_callback(
+                            "generating",
+                            base_progress,
+                            t('progress.sectionDone', title=section.title),
+                        )
+                    continue
+
+                # 章节之间的暂停检查点
+                if pause_signal is not None:
+                    pause_signal.checkpoint()
+
                 # 更新进度
                 ReportManager.update_progress(
                     report_id, "generating", base_progress,
@@ -1780,7 +1826,26 @@ class ReportAgent:
                 self.console_logger = None
             
             return report
-            
+
+        except JobCancelled:
+            # 用户暂停/停止：保留已完成章节，状态记为 pending 以便续跑，
+            # 不写成 FAILED（否则前端显示错误，且重跑会从头规划大纲）。
+            logger.info(f"报告生成被用户暂停: {report_id}")
+            report.status = ReportStatus.PENDING
+            report.error = None
+            try:
+                ReportManager.save_report(report)
+                ReportManager.update_progress(
+                    report_id, "paused", -2, t('progress.reportPaused'),
+                    completed_sections=completed_section_titles
+                )
+            except Exception:
+                pass
+            if self.console_logger:
+                self.console_logger.close()
+                self.console_logger = None
+            raise
+
         except Exception as e:
             logger.error(t('report.reportGenFailed', error=str(e)))
             report.status = ReportStatus.FAILED
@@ -2135,8 +2200,32 @@ class ReportManager:
         
         with open(cls._get_outline_path(report_id), 'w', encoding='utf-8') as f:
             json.dump(outline.to_dict(), f, ensure_ascii=False, indent=2)
-        
+
         logger.info(t('report.outlineSaved', reportId=report_id))
+
+    @classmethod
+    def load_outline(cls, report_id: str) -> Optional[ReportOutline]:
+        """读取已保存的大纲（用于续跑时跳过重新规划）。"""
+        path = cls._get_outline_path(report_id)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            sections = [
+                ReportSection(title=s.get("title", ""), content=s.get("content", ""))
+                for s in data.get("sections", [])
+            ]
+            if not sections:
+                return None
+            return ReportOutline(
+                title=data.get("title", ""),
+                summary=data.get("summary", ""),
+                sections=sections,
+            )
+        except (json.JSONDecodeError, OSError, TypeError) as e:
+            logger.warning(f"读取报告大纲失败，将重新规划: {report_id}: {e}")
+            return None
     
     @classmethod
     def save_section(

@@ -905,6 +905,9 @@ const pollPrepareStatus = async () => {
         stopPolling()
         stopProfilesPolling()
         await loadPreparedData()
+      } else if (data.status === 'paused' || data.job_state === 'paused') {
+        // 用户暂停：保留已完成人设，不视为失败；继续轮询以便恢复后自动接上
+        emit('update-status', 'paused')
       } else if (data.status === 'failed') {
         handlePrepareFailure(data.error)
       }

@@ -22,6 +22,13 @@
 
       <div class="header-right">
         <LanguageSwitcher />
+        <JobToggleButton
+          v-if="jobToggleVisible"
+          :state="jobState"
+          :busy="jobBusy"
+          @pause="handlePauseSim"
+          @resume="handleResumeSim"
+        />
         <div class="step-divider"></div>
         <div class="workflow-step">
           <span class="step-num">Step 3/5</span>
@@ -74,8 +81,18 @@ import { useRoute, useRouter } from 'vue-router'
 import GraphPanel from '../components/GraphPanel.vue'
 import Step3Simulation from '../components/Step3Simulation.vue'
 import { getProject, getGraphData } from '../api/graph'
-import { getSimulation, getSimulationConfig, stopSimulation, closeSimulationEnv, getEnvStatus } from '../api/simulation'
+import {
+  getSimulation,
+  getSimulationConfig,
+  stopSimulation,
+  closeSimulationEnv,
+  getEnvStatus,
+  pauseSimulation,
+  resumeSimulation,
+  getRunStatus,
+} from '../api/simulation'
 import LanguageSwitcher from '../components/LanguageSwitcher.vue'
+import JobToggleButton from '../components/JobToggleButton.vue'
 import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
@@ -116,16 +133,70 @@ const rightPanelStyle = computed(() => {
 
 // --- Status Computed ---
 const statusClass = computed(() => {
+  if (jobState.value === 'paused') return 'paused'
   return currentStatus.value
 })
 
 const statusText = computed(() => {
+  if (jobState.value === 'paused') return t('common.paused')
   if (currentStatus.value === 'error') return 'Error'
   if (currentStatus.value === 'completed') return 'Completed'
   return 'Running'
 })
 
 const isSimulating = computed(() => currentStatus.value === 'processing')
+
+// --- 暂停/继续（Step3 模拟运行） ---
+const jobState = ref('idle') // idle | running | paused
+const jobBusy = ref(false)
+const jobToggleVisible = computed(
+  () => jobState.value === 'running' || jobState.value === 'paused'
+)
+
+const handlePauseSim = async () => {
+  if (jobBusy.value) return
+  jobBusy.value = true
+  try {
+    await pauseSimulation({ simulation_id: currentSimulationId.value })
+    jobState.value = 'paused'
+    addLog(t('common.paused'))
+  } catch (err) {
+    addLog(`Pause failed: ${err.message}`)
+  } finally {
+    jobBusy.value = false
+  }
+}
+
+const handleResumeSim = async () => {
+  if (jobBusy.value) return
+  jobBusy.value = true
+  try {
+    await resumeSimulation({ simulation_id: currentSimulationId.value })
+    jobState.value = 'running'
+    addLog(t('common.resume'))
+  } catch (err) {
+    addLog(`Resume failed: ${err.message}`)
+  } finally {
+    jobBusy.value = false
+  }
+}
+
+// 页面重开时校正：只有真正 running/paused 的模拟才显示暂停按钮
+const syncJobStateFromRunStatus = async () => {
+  try {
+    const res = await getRunStatus(currentSimulationId.value)
+    const runnerStatus = res?.data?.runner_status
+    if (runnerStatus === 'paused') {
+      jobState.value = 'paused'
+    } else if (runnerStatus === 'running' || runnerStatus === 'starting') {
+      jobState.value = 'running'
+    } else {
+      jobState.value = 'idle'
+    }
+  } catch {
+    jobState.value = 'idle'
+  }
+}
 
 // --- Helpers ---
 const addLog = (msg) => {
@@ -138,6 +209,12 @@ const addLog = (msg) => {
 
 const updateStatus = (status) => {
   currentStatus.value = status
+  // 子组件轮询到 paused 时同步到顶部控制按钮
+  if (status === 'paused') {
+    jobState.value = 'paused'
+  } else if (status === 'processing' && jobState.value !== 'paused') {
+    jobState.value = 'running'
+  }
 }
 
 // --- Layout Methods ---
@@ -301,13 +378,14 @@ watch(isSimulating, (newValue) => {
 
 onMounted(() => {
   addLog(t('log.simRunViewInit'))
-  
+
   // 记录 maxRounds 配置（值已在初始化时从 query 参数获取）
   if (maxRounds.value) {
     addLog(t('log.customRounds', { rounds: maxRounds.value }))
   }
-  
+
   loadSimulationData()
+  syncJobStateFromRunStatus()
 })
 
 onUnmounted(() => {
@@ -427,6 +505,7 @@ onUnmounted(() => {
 .status-indicator.processing .dot { background: #FF5722; animation: pulse 1s infinite; }
 .status-indicator.completed .dot { background: #4CAF50; }
 .status-indicator.error .dot { background: #F44336; }
+.status-indicator.paused .dot { background: #999; box-shadow: 0 0 0 3px rgba(0,0,0,0.08); }
 
 @keyframes pulse { 50% { opacity: 0.5; } }
 

@@ -2156,10 +2156,15 @@ const fetchConsoleLog = async () => {
 
 const startPolling = () => {
   if (agentLogTimer || consoleLogTimer) return
-  
+
+  // 开始轮询即视为报告正在生成，让父级显示暂停按钮
+  if (!isComplete.value) {
+    emit('update-status', 'processing')
+  }
+
   fetchAgentLog()
   fetchConsoleLog()
-  
+
   agentLogTimer = setInterval(fetchAgentLog, 2000)
   consoleLogTimer = setInterval(fetchConsoleLog, 1500)
 }

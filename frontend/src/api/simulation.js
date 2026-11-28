@@ -186,3 +186,35 @@ export const interviewAgents = (data) => {
 export const getSimulationHistory = (limit = 20) => {
   return service.get('/api/simulation/history', { params: { limit } })
 }
+
+/**
+ * 暂停模拟（不终止进程，从当前轮次无缝继续）
+ * @param {Object} data - { simulation_id }
+ */
+export const pauseSimulation = (data) => {
+  return service.post('/api/simulation/pause', data)
+}
+
+/**
+ * 继续已暂停的模拟
+ * @param {Object} data - { simulation_id }
+ */
+export const resumeSimulation = (data) => {
+  return service.post('/api/simulation/resume', data)
+}
+
+/**
+ * 暂停环境准备（已生成的人设保留）
+ * @param {Object} data - { simulation_id }
+ */
+export const pausePrepare = (data) => {
+  return service.post('/api/simulation/prepare/pause', data)
+}
+
+/**
+ * 继续已暂停的环境准备
+ * @param {Object} data - { simulation_id }
+ */
+export const resumePrepare = (data) => {
+  return service.post('/api/simulation/prepare/resume', data)
+}

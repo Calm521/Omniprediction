@@ -22,6 +22,13 @@
 
       <div class="header-right">
         <LanguageSwitcher />
+        <JobToggleButton
+          v-if="jobToggleVisible"
+          :state="jobState"
+          :busy="jobBusy"
+          @pause="handlePause"
+          @resume="handleResume"
+        />
         <div class="step-divider"></div>
         <div class="workflow-step">
           <span class="step-num">Step {{ currentStep }}/5</span>
@@ -83,9 +90,10 @@ import { useI18n } from 'vue-i18n'
 import GraphPanel from '../components/GraphPanel.vue'
 import Step1GraphBuild from '../components/Step1GraphBuild.vue'
 import Step2EnvSetup from '../components/Step2EnvSetup.vue'
-import { generateOntology, getProject, buildGraph, getTaskStatus, getGraphData } from '../api/graph'
+import { generateOntology, getProject, buildGraph, getTaskStatus, getGraphData, getGraphBuildJob, pauseGraphBuild, resumeGraphBuild } from '../api/graph'
 import { getPendingUpload, clearPendingUpload } from '../store/pendingUpload'
 import LanguageSwitcher from '../components/LanguageSwitcher.vue'
+import JobToggleButton from '../components/JobToggleButton.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -130,17 +138,81 @@ const rightPanelStyle = computed(() => {
 // --- Status Computed ---
 const statusClass = computed(() => {
   if (error.value) return 'error'
+  if (jobState.value === 'paused') return 'paused'
   if (currentPhase.value >= 2) return 'completed'
   return 'processing'
 })
 
 const statusText = computed(() => {
   if (error.value) return 'Error'
+  if (jobState.value === 'paused') return t('common.paused')
   if (currentPhase.value >= 2) return 'Ready'
   if (currentPhase.value === 1) return 'Building Graph'
   if (currentPhase.value === 0) return 'Generating Ontology'
   return 'Initializing'
 })
+
+// --- 暂停/继续（Step1 图谱构建） ---
+const jobState = ref('idle') // idle | running | paused
+const jobBusy = ref(false)
+const jobToggleVisible = computed(
+  () => currentStep.value === 1 && (jobState.value === 'running' || jobState.value === 'paused')
+)
+
+const refreshJobState = async () => {
+  if (currentStep.value !== 1 || !currentProjectId.value || currentProjectId.value === 'new') {
+    jobState.value = 'idle'
+    return
+  }
+  try {
+    const res = await getGraphBuildJob(currentProjectId.value)
+    const state = res?.data?.state
+    if (state === 'paused') jobState.value = 'paused'
+    else if (state === 'running') jobState.value = 'running'
+    else jobState.value = 'idle'
+  } catch {
+    jobState.value = currentPhase.value === 1 ? 'running' : 'idle'
+  }
+}
+
+const handlePause = async () => {
+  if (jobBusy.value) return
+  jobBusy.value = true
+  try {
+    await pauseGraphBuild(currentProjectId.value)
+    jobState.value = 'paused'
+    stopPolling()
+    stopGraphPolling()
+    addLog(t('common.paused'))
+  } catch (err) {
+    error.value = err.message
+    addLog(`Pause failed: ${err.message}`)
+  } finally {
+    jobBusy.value = false
+  }
+}
+
+const handleResume = async () => {
+  if (jobBusy.value) return
+  jobBusy.value = true
+  try {
+    const res = await resumeGraphBuild(currentProjectId.value)
+    jobState.value = 'running'
+    addLog(t('common.resume'))
+    const taskId = res?.data?.task_id
+    if (taskId) {
+      startPollingTask(taskId)
+    } else {
+      await loadProject()
+    }
+  } catch (err) {
+    error.value = err.message
+    addLog(`Resume failed: ${err.message}`)
+  } finally {
+    jobBusy.value = false
+  }
+}
+
 
 // --- Helpers ---
 const addLog = (msg) => {
@@ -245,9 +317,13 @@ const loadProject = async () => {
         await startBuildGraph()
       } else if (res.data.status === 'graph_building' && res.data.graph_build_task_id) {
         currentPhase.value = 1
-        startPollingTask(res.data.graph_build_task_id)
+        await refreshJobState()
+        if (jobState.value !== 'paused') {
+          startPollingTask(res.data.graph_build_task_id)
+        }
       } else if (res.data.status === 'graph_completed' && res.data.graph_id) {
         currentPhase.value = 2
+        jobState.value = 'idle'
         await loadGraph(res.data.graph_id)
       }
     } else {
@@ -275,6 +351,7 @@ const updatePhaseByStatus = (status) => {
 const startBuildGraph = async () => {
   try {
     currentPhase.value = 1
+    jobState.value = 'running'
     buildProgress.value = { progress: 0, message: 'Starting build...' }
     addLog('Initiating graph build...')
     
@@ -350,6 +427,7 @@ const pollTaskStatus = async (taskId) => {
         stopPolling()
         stopGraphPolling() // Stop polling, do final load
         currentPhase.value = 2
+        jobState.value = 'idle'
         
         // Final load
         const projRes = await getProject(currentProjectId.value)
@@ -530,6 +608,7 @@ onUnmounted(() => {
 .status-indicator.processing .dot { background: #FF5722; animation: pulse 1s infinite; }
 .status-indicator.completed .dot { background: #4CAF50; }
 .status-indicator.error .dot { background: #F44336; }
+.status-indicator.paused .dot { background: #999; box-shadow: 0 0 0 3px rgba(0,0,0,0.08); }
 
 @keyframes pulse { 50% { opacity: 0.5; } }
 

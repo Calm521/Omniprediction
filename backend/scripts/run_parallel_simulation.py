@@ -81,6 +81,10 @@ from typing import Dict, Any, List, Optional, Tuple
 _shutdown_event = None
 _cleanup_done = False
 
+# 暂停标志文件：Flask 侧创建该文件即请求暂停，删除即恢复。
+# 只有在轮次边界检查，保证一轮的 Agent 动作原子完成。
+PAUSE_FLAG_FILENAME = "pause.flag"
+
 # 添加 backend 目录到路径
 # 脚本固定位于 backend/scripts/ 目录
 _scripts_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1037,6 +1041,60 @@ def create_model(config: Dict[str, Any], use_boost: bool = False):
     )
 
 
+def _pause_flag_path(simulation_dir: str) -> str:
+    return os.path.join(simulation_dir, PAUSE_FLAG_FILENAME)
+
+
+def wait_if_paused(simulation_dir: str, log_info=None) -> None:
+    """轮次边界等待：Flask 创建 pause.flag 即挂起，删除即恢复。
+
+    暂停期间不发起任何 LLM 调用、不推进轮次，进程与数据库都保持存活，
+    因此恢复时可以直接从当前轮次继续，无需重建环境。
+    """
+    flag = _pause_flag_path(simulation_dir)
+    if not os.path.exists(flag):
+        return
+    msg = "收到暂停请求，在轮次边界挂起..."
+    if log_info:
+        log_info(msg)
+    else:
+        print(msg)
+    while os.path.exists(flag):
+        if _shutdown_event and _shutdown_event.is_set():
+            return
+        time.sleep(0.5)
+    msg = "收到继续请求，恢复模拟..."
+    if log_info:
+        log_info(msg)
+    else:
+        print(msg)
+
+
+def _read_last_completed_round(actions_log_path: str) -> int:
+    """从 actions.jsonl 中读出最后完成的轮次（round_end 事件）。
+
+    用于进程被停止后再次启动时跳过已完成的轮次。
+    """
+    last_round = 0
+    if not os.path.exists(actions_log_path):
+        return last_round
+    try:
+        with open(actions_log_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get('event_type') == 'round_end':
+                    last_round = max(last_round, int(entry.get('round', 0) or 0))
+    except OSError:
+        pass
+    return last_round
+
+
 def get_active_agents_for_round(
     env,
     config: Dict[str, Any],
@@ -1149,17 +1207,30 @@ async def run_twitter_simulation(
             agent_names[agent_id] = getattr(agent, 'name', f'Agent_{agent_id}')
     
     db_path = os.path.join(simulation_dir, "twitter_simulation.db")
-    if os.path.exists(db_path):
+    actions_log_path = os.path.join(simulation_dir, "twitter", "actions.jsonl")
+
+    # 续跑判定：上一轮停止后是否已有已完成轮次。
+    # 有则复用现有数据库（保留已发生的社交互动），并跳过已完成轮次；
+    # 无则清库从头开始，保证"重新开始"语义不变。
+    resume_from_round = _read_last_completed_round(actions_log_path)
+    resuming = resume_from_round > 0 and os.path.exists(db_path)
+    if resuming:
+        log_info(f"检测到已完成 {resume_from_round} 轮，进入续跑模式（复用已有数据库）")
+    elif os.path.exists(db_path):
         os.remove(db_path)
-    
+
     result.env = oasis.make(
         agent_graph=result.agent_graph,
         platform=oasis.DefaultPlatformType.TWITTER,
         database_path=db_path,
         semaphore=30,  # 限制最大并发 LLM 请求数，防止 API 过载
     )
-    
+
     await result.env.reset()
+    if resuming:
+        # 恢复时间步进，避免后续动作时间戳倒退
+        result.env.platform.sandbox_clock.time_step = resume_from_round
+
     log_info("环境已启动")
     
     if action_logger:
@@ -1168,47 +1239,53 @@ async def run_twitter_simulation(
     total_actions = 0
     last_rowid = 0  # 跟踪数据库中最后处理的行号（使用 rowid 避免 created_at 格式差异）
     
-    # 执行初始事件
+    # 执行初始事件（续跑时跳过，避免重复发布种子帖）
     event_config = config.get("event_config", {})
     initial_posts = event_config.get("initial_posts", [])
-    
-    # 记录 round 0 开始（初始事件阶段）
-    if action_logger:
-        action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
-    
-    initial_action_count = 0
-    if initial_posts:
-        initial_actions = {}
-        for post in initial_posts:
-            agent_id = post.get("poster_agent_id", 0)
-            content = post.get("content", "")
-            try:
-                agent = result.env.agent_graph.get_agent(agent_id)
-                initial_actions[agent] = ManualAction(
-                    action_type=ActionType.CREATE_POST,
-                    action_args={"content": content}
-                )
-                
-                if action_logger:
-                    action_logger.log_action(
-                        round_num=0,
-                        agent_id=agent_id,
-                        agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
-                        action_type="CREATE_POST",
+
+    if resuming:
+        log_info("续跑模式：跳过初始帖子发布（已在首次运行时完成）")
+        if action_logger:
+            action_logger.log_round_start(0, 0)
+            action_logger.log_round_end(0, 0)
+    else:
+        # 记录 round 0 开始（初始事件阶段）
+        if action_logger:
+            action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
+
+        initial_action_count = 0
+        if initial_posts:
+            initial_actions = {}
+            for post in initial_posts:
+                agent_id = post.get("poster_agent_id", 0)
+                content = post.get("content", "")
+                try:
+                    agent = result.env.agent_graph.get_agent(agent_id)
+                    initial_actions[agent] = ManualAction(
+                        action_type=ActionType.CREATE_POST,
                         action_args={"content": content}
                     )
-                    total_actions += 1
-                    initial_action_count += 1
-            except Exception:
-                pass
-        
-        if initial_actions:
-            await result.env.step(initial_actions)
-            log_info(f"已发布 {len(initial_actions)} 条初始帖子")
-    
-    # 记录 round 0 结束
-    if action_logger:
-        action_logger.log_round_end(0, initial_action_count)
+
+                    if action_logger:
+                        action_logger.log_action(
+                            round_num=0,
+                            agent_id=agent_id,
+                            agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
+                            action_type="CREATE_POST",
+                            action_args={"content": content}
+                        )
+                        total_actions += 1
+                        initial_action_count += 1
+                except Exception:
+                    pass
+
+            if initial_actions:
+                await result.env.step(initial_actions)
+                log_info(f"已发布 {len(initial_actions)} 条初始帖子")
+
+        # 记录 round 0 结束
+        if action_logger:
+            action_logger.log_round_end(0, initial_action_count)
     
     # 主模拟循环
     time_config = config.get("time_config", {})
@@ -1224,18 +1301,28 @@ async def run_twitter_simulation(
             log_info(f"轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
     
     start_time = datetime.now()
-    
+
     for round_num in range(total_rounds):
-        # 检查是否收到退出信号
+        # 续跑时跳过已完成轮次
+        if resuming and round_num < resume_from_round:
+            continue
+
+        # 轮次边界：检查暂停/退出信号
         if _shutdown_event and _shutdown_event.is_set():
             if main_logger:
                 main_logger.info(f"收到退出信号，在第 {round_num + 1} 轮停止模拟")
             break
-        
+
+        wait_if_paused(simulation_dir, log_info)
+        if _shutdown_event and _shutdown_event.is_set():
+            if main_logger:
+                main_logger.info(f"暂停期间收到退出信号，在第 {round_num + 1} 轮停止模拟")
+            break
+
         simulated_minutes = round_num * minutes_per_round
         simulated_hour = (simulated_minutes // 60) % 24
         simulated_day = simulated_minutes // (60 * 24) + 1
-        
+
         active_agents = get_active_agents_for_round(
             result.env, config, simulated_hour, round_num
         )
@@ -1340,17 +1427,27 @@ async def run_reddit_simulation(
             agent_names[agent_id] = getattr(agent, 'name', f'Agent_{agent_id}')
     
     db_path = os.path.join(simulation_dir, "reddit_simulation.db")
-    if os.path.exists(db_path):
+    actions_log_path = os.path.join(simulation_dir, "reddit", "actions.jsonl")
+
+    # 续跑判定（与 Twitter 相同逻辑）
+    resume_from_round = _read_last_completed_round(actions_log_path)
+    resuming = resume_from_round > 0 and os.path.exists(db_path)
+    if resuming:
+        log_info(f"检测到已完成 {resume_from_round} 轮，进入续跑模式（复用已有数据库）")
+    elif os.path.exists(db_path):
         os.remove(db_path)
-    
+
     result.env = oasis.make(
         agent_graph=result.agent_graph,
         platform=oasis.DefaultPlatformType.REDDIT,
         database_path=db_path,
         semaphore=30,  # 限制最大并发 LLM 请求数，防止 API 过载
     )
-    
+
     await result.env.reset()
+    if resuming:
+        result.env.platform.sandbox_clock.time_step = resume_from_round
+
     log_info("环境已启动")
     
     if action_logger:
@@ -1359,53 +1456,59 @@ async def run_reddit_simulation(
     total_actions = 0
     last_rowid = 0  # 跟踪数据库中最后处理的行号（使用 rowid 避免 created_at 格式差异）
     
-    # 执行初始事件
+    # 执行初始事件（续跑时跳过，避免重复发布种子帖）
     event_config = config.get("event_config", {})
     initial_posts = event_config.get("initial_posts", [])
-    
-    # 记录 round 0 开始（初始事件阶段）
-    if action_logger:
-        action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
-    
-    initial_action_count = 0
-    if initial_posts:
-        initial_actions = {}
-        for post in initial_posts:
-            agent_id = post.get("poster_agent_id", 0)
-            content = post.get("content", "")
-            try:
-                agent = result.env.agent_graph.get_agent(agent_id)
-                if agent in initial_actions:
-                    if not isinstance(initial_actions[agent], list):
-                        initial_actions[agent] = [initial_actions[agent]]
-                    initial_actions[agent].append(ManualAction(
-                        action_type=ActionType.CREATE_POST,
-                        action_args={"content": content}
-                    ))
-                else:
-                    initial_actions[agent] = ManualAction(
-                        action_type=ActionType.CREATE_POST,
-                        action_args={"content": content}
-                    )
-                
-                if action_logger:
-                    action_logger.log_action(
-                        round_num=0,
-                        agent_id=agent_id,
-                        agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
-                        action_type="CREATE_POST",
-                        action_args={"content": content}
-                    )
-                    total_actions += 1
-                    initial_action_count += 1
-            except Exception:
-                pass
-        
-        if initial_actions:
-            await result.env.step(initial_actions)
-            log_info(f"已发布 {len(initial_actions)} 条初始帖子")
-    
-    # 记录 round 0 结束
+
+    if resuming:
+        log_info("续跑模式：跳过初始帖子发布（已在首次运行时完成）")
+        if action_logger:
+            action_logger.log_round_start(0, 0)
+            action_logger.log_round_end(0, 0)
+    else:
+        # 记录 round 0 开始（初始事件阶段）
+        if action_logger:
+            action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
+
+        initial_action_count = 0
+        if initial_posts:
+            initial_actions = {}
+            for post in initial_posts:
+                agent_id = post.get("poster_agent_id", 0)
+                content = post.get("content", "")
+                try:
+                    agent = result.env.agent_graph.get_agent(agent_id)
+                    if agent in initial_actions:
+                        if not isinstance(initial_actions[agent], list):
+                            initial_actions[agent] = [initial_actions[agent]]
+                        initial_actions[agent].append(ManualAction(
+                            action_type=ActionType.CREATE_POST,
+                            action_args={"content": content}
+                        ))
+                    else:
+                        initial_actions[agent] = ManualAction(
+                            action_type=ActionType.CREATE_POST,
+                            action_args={"content": content}
+                        )
+
+                    if action_logger:
+                        action_logger.log_action(
+                            round_num=0,
+                            agent_id=agent_id,
+                            agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
+                            action_type="CREATE_POST",
+                            action_args={"content": content}
+                        )
+                        total_actions += 1
+                        initial_action_count += 1
+                except Exception:
+                    pass
+
+            if initial_actions:
+                await result.env.step(initial_actions)
+                log_info(f"已发布 {len(initial_actions)} 条初始帖子")
+
+        # 记录 round 0 结束
     if action_logger:
         action_logger.log_round_end(0, initial_action_count)
     
@@ -1423,18 +1526,28 @@ async def run_reddit_simulation(
             log_info(f"轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
     
     start_time = datetime.now()
-    
+
     for round_num in range(total_rounds):
-        # 检查是否收到退出信号
+        # 续跑时跳过已完成轮次
+        if resuming and round_num < resume_from_round:
+            continue
+
+        # 轮次边界：检查暂停/退出信号
         if _shutdown_event and _shutdown_event.is_set():
             if main_logger:
                 main_logger.info(f"收到退出信号，在第 {round_num + 1} 轮停止模拟")
             break
-        
+
+        wait_if_paused(simulation_dir, log_info)
+        if _shutdown_event and _shutdown_event.is_set():
+            if main_logger:
+                main_logger.info(f"暂停期间收到退出信号，在第 {round_num + 1} 轮停止模拟")
+            break
+
         simulated_minutes = round_num * minutes_per_round
         simulated_hour = (simulated_minutes // 60) % 24
         simulated_day = simulated_minutes // (60 * 24) + 1
-        
+
         active_agents = get_active_agents_for_round(
             result.env, config, simulated_hour, round_num
         )

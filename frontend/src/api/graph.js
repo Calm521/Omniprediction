@@ -64,3 +64,36 @@ export function getProject(projectId) {
     method: 'get'
   })
 }
+
+/**
+ * 暂停图谱构建（Zep 批次保留，可续跑）
+ * @param {String} projectId
+ */
+export function pauseGraphBuild(projectId) {
+  return service({
+    url: `/api/graph/project/${projectId}/pause`,
+    method: 'post'
+  })
+}
+
+/**
+ * 继续已暂停的图谱构建（作业已退出时自动重新发起并续跑）
+ * @param {String} projectId
+ */
+export function resumeGraphBuild(projectId) {
+  return service({
+    url: `/api/graph/project/${projectId}/resume`,
+    method: 'post'
+  })
+}
+
+/**
+ * 查询图谱构建作业状态（暂停/运行/完成）
+ * @param {String} projectId
+ */
+export function getGraphBuildJob(projectId) {
+  return service({
+    url: `/api/graph/project/${projectId}/job`,
+    method: 'get'
+  })
+}

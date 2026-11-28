@@ -411,6 +411,7 @@ class GraphBuilderService:
         batch_size: int = 350,
         progress_callback: Optional[Callable] = None,
         batch_created_callback: Optional[Callable[[str | None, str], None]] = None,
+        pause_signal=None,
     ) -> BatchSubmission:
         """Submit document chunks through Zep's current Batch API.
 
@@ -456,6 +457,10 @@ class GraphBuilderService:
 
         episode_uuids: List[str] = []
         for i in range(0, total_chunks, batch_size):
+            # 每个分块批次前检查暂停/取消：Zep 批次已创建，暂停可安全恢复
+            if pause_signal is not None:
+                pause_signal.checkpoint()
+
             batch_chunks = chunks[i:i + batch_size]
             batch_num = i // batch_size + 1
             total_batches = (total_chunks + batch_size - 1) // batch_size
@@ -633,15 +638,31 @@ class GraphBuilderService:
         submission: BatchSubmission,
         progress_callback: Optional[Callable] = None,
         timeout: int | None = None,
+        pause_signal=None,
     ) -> List[str]:
-        """Wait for a Batch API terminal state and validate every item."""
+        """Wait for a Batch API terminal state and validate every item.
+
+        When ``pause_signal`` is provided, the polling loop honours pause
+        requests: the Zep batch keeps processing server-side (there is no
+        cancel API), but we stop polling and progress reporting until resumed.
+        Because the batch identity is persisted, a later rebuild resumes the
+        same batch instead of re-uploading chunks.
+        """
 
         timeout = timeout or ZEP_INGESTION_WAIT_TIMEOUT_SECONDS
         start_time = time.time()
+        # Paused time must not count against the ingestion timeout.
+        paused_total = 0.0
         terminal_states = {"succeeded", "partial", "failed", "invalid", "canceled"}
 
         while True:
-            if time.time() - start_time > timeout:
+            if pause_signal is not None and pause_signal.is_paused:
+                # checkpoint() 阻塞直到 resume；暂停时长不计入超时预算
+                pause_started = time.time()
+                pause_signal.checkpoint()
+                paused_total += time.time() - pause_started
+
+            if time.time() - start_time - paused_total > timeout:
                 raise TimeoutError(
                     f"Zep batch {submission.batch_id} did not finish within {timeout}s"
                 )

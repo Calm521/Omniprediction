@@ -25,6 +25,13 @@ from ..models.project import ProjectManager, ProjectStatus
 from ..services.simulation_manager import SimulationManager
 from ..services.simulation_runner import SimulationRunner, RunnerStatus
 from ..services.zep_graph_memory_updater import ZepGraphMemoryManager
+from ..services.job_control import (
+    JobCancelled,
+    JobControl,
+    JobPhase,
+    JobState,
+    JobStateStore,
+)
 from ..utils.llm_client import LLMResponseError
 
 # 获取日志器
@@ -161,6 +168,111 @@ def list_projects():
         "data": [p.to_dict() for p in projects],
         "count": len(projects)
     })
+
+
+@graph_bp.route('/project/<project_id>/job', methods=['GET'])
+def get_graph_build_job(project_id: str):
+    """查询图谱构建作业的暂停状态（页面刷新/重开后恢复控制关系）。"""
+    project = ProjectManager.get_project(project_id)
+    if not project:
+        return jsonify({
+            "success": False,
+            "error": t('api.projectNotFound', id=project_id)
+        }), 404
+
+    stored = JobStateStore.load(JobPhase.GRAPH_BUILD, project_id)
+    signal = JobControl().get(JobControl.make_key(JobPhase.GRAPH_BUILD, project_id))
+
+    state = stored.get("state") if stored else None
+    # 运行中的作业以内存信号为准：暂停是即时的，不依赖落盘时机
+    if signal is not None:
+        state = "paused" if signal.is_paused else "running"
+    elif project.status == ProjectStatus.GRAPH_COMPLETED:
+        state = "completed"
+    elif state is None:
+        state = "idle"
+
+    return jsonify({
+        "success": True,
+        "data": {
+            "phase": JobPhase.GRAPH_BUILD.value,
+            "resource_id": project_id,
+            "state": state,
+            "progress": (stored or {}).get("progress", 0),
+            "message": (stored or {}).get("message", ""),
+            "resumable": (stored or {}).get("resumable", True),
+            "project_status": project.status.value,
+            "task_id": project.graph_build_task_id,
+        }
+    })
+
+
+@graph_bp.route('/project/<project_id>/pause', methods=['POST'])
+def pause_graph_build(project_id: str):
+    """暂停图谱构建（不取消 Zap 批次，可续跑）。"""
+    project = ProjectManager.get_project(project_id)
+    if not project:
+        return jsonify({
+            "success": False,
+            "error": t('api.projectNotFound', id=project_id)
+        }), 404
+
+    job_key = JobControl.make_key(JobPhase.GRAPH_BUILD, project_id)
+    pause_signal = JobControl().get(job_key)
+    if pause_signal is None or not _project_has_active_build(project):
+        return jsonify({
+            "success": False,
+            "error": t('api.graphNotBuilding')
+        }), 400
+
+    pause_signal.pause()
+    JobStateStore.save(
+        JobPhase.GRAPH_BUILD, project_id, JobState.PAUSED,
+        progress=55,
+        message=t('api.graphBuildPaused'),
+        resumable=True,
+        extra={"graph_id": project.graph_id},
+    )
+    logger.info(f"图谱构建已暂停: project_id={project_id}")
+    return jsonify({
+        "success": True,
+        "data": {
+            "project_id": project_id,
+            "state": JobState.PAUSED.value,
+            "resumable": True,
+        }
+    })
+
+
+@graph_bp.route('/project/<project_id>/resume', methods=['POST'])
+def resume_graph_build(project_id: str):
+    """继续已暂停的图谱构建；若作业已退出，则重新发起 build（复用已有 Zep 批次）。"""
+    project = ProjectManager.get_project(project_id)
+    if not project:
+        return jsonify({
+            "success": False,
+            "error": t('api.projectNotFound', id=project_id)
+        }), 404
+
+    job_key = JobControl.make_key(JobPhase.GRAPH_BUILD, project_id)
+    pause_signal = JobControl().get(job_key)
+    if pause_signal is not None and pause_signal.is_paused:
+        pause_signal.resume()
+        JobStateStore.save(
+            JobPhase.GRAPH_BUILD, project_id, JobState.RUNNING,
+            progress=55,
+            message=t('progress.waitingZepProcess'),
+            resumable=True,
+        )
+        logger.info(f"图谱构建已继续: project_id={project_id}")
+        return jsonify({
+            "success": True,
+            "data": {"project_id": project_id, "state": JobState.RUNNING.value}
+        })
+
+    # 作业线程已不存在（例如服务重启或已停止）：重新触发构建并续跑批次
+    logger.info(f"图谱构建作业不在运行，重新发起续跑: project_id={project_id}")
+    return _build_graph_impl()
 
 
 @graph_bp.route('/project/<project_id>', methods=['DELETE'])
@@ -647,6 +759,16 @@ def _build_graph_impl():
         # Capture locale before spawning background thread
         current_locale = get_locale()
 
+        # 一个项目同时只有一个构建作业；暂停信号按 project_id 复用
+        job_key = JobControl.make_key(JobPhase.GRAPH_BUILD, project_id)
+        pause_signal = JobControl().get_or_create(job_key)
+        pause_signal.resume()  # 新的一次构建从运行态开始
+
+        JobStateStore.save(
+            JobPhase.GRAPH_BUILD, project_id, JobState.RUNNING,
+            progress=0, message=t('progress.initGraphService'), resumable=True,
+        )
+
         # 启动后台任务
         def build_task():
             set_locale(current_locale)
@@ -745,6 +867,7 @@ def _build_graph_impl():
                         batch_size=350,
                         progress_callback=add_progress_callback,
                         batch_created_callback=remember_batch,
+                        pause_signal=pause_signal,
                     )
                 
                 # 等待Zep处理完成（查询每个episode的processed状态）
@@ -762,8 +885,11 @@ def _build_graph_impl():
                         progress=progress
                     )
                 
-                builder._wait_for_batch(submission, wait_progress_callback)
-                
+                builder._wait_for_batch(submission, wait_progress_callback, pause_signal=pause_signal)
+
+                # 等待完成后再次确认暂停/取消（用户可能在 Zep 处理期间暂停）
+                pause_signal.checkpoint()
+
                 # 获取图谱数据
                 task_manager.update_task(
                     task_id,
@@ -771,7 +897,7 @@ def _build_graph_impl():
                     progress=95
                 )
                 graph_data = builder.get_graph_data(graph_id)
-                
+
                 node_count = graph_data.get("node_count", 0)
                 edge_count = graph_data.get("edge_count", 0)
                 build_logger.info(f"[{task_id}] 图谱构建完成: graph_id={graph_id}, 节点={node_count}, 边={edge_count}")
@@ -797,7 +923,33 @@ def _build_graph_impl():
                             "zep_batch_id": submission.batch_id,
                         }
                     )
-                
+                JobStateStore.save(
+                    JobPhase.GRAPH_BUILD, project_id, JobState.COMPLETED,
+                    progress=100, message=t('progress.graphBuildComplete'), resumable=False,
+                    extra={"graph_id": graph_id, "node_count": node_count, "edge_count": edge_count},
+                )
+                JobControl().drop(job_key)
+
+            except JobCancelled:
+                # 用户停止构图：保留未完成的 Zep batch 与 GRAPH_BUILDING 状态，
+                # 这样再次 /build 能通过 persisted batch 续跑，而不是重建图谱。
+                build_logger.info(f"[{task_id}] 构图作业被用户停止")
+                with _project_build_lock(project_id):
+                    project.error = None
+                    ProjectManager.save_project(project)
+                    task_manager.update_task(
+                        task_id,
+                        status=TaskStatus.FAILED,
+                        message=t('api.graphBuildPaused'),
+                    )
+                JobStateStore.save(
+                    JobPhase.GRAPH_BUILD, project_id, JobState.PAUSED,
+                    progress=55,
+                    message=t('api.graphBuildPaused'),
+                    resumable=True,
+                )
+                JobControl().drop(job_key)
+
             except Exception as e:
                 # 更新项目状态为失败
                 build_logger.error(f"[{task_id}] 图谱构建失败: {str(e)}")

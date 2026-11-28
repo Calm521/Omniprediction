@@ -22,6 +22,13 @@
 
       <div class="header-right">
         <LanguageSwitcher />
+        <JobToggleButton
+          v-if="jobToggleVisible"
+          :state="jobState"
+          :busy="jobBusy"
+          @pause="handlePauseReport"
+          @resume="handleResumeReport"
+        />
         <div class="step-divider"></div>
         <div class="workflow-step">
           <span class="step-num">Step 4/5</span>
@@ -71,8 +78,9 @@ import GraphPanel from '../components/GraphPanel.vue'
 import Step4Report from '../components/Step4Report.vue'
 import { getProject, getGraphData } from '../api/graph'
 import { getSimulation } from '../api/simulation'
-import { getReport } from '../api/report'
+import { getReport, pauseReport, resumeReport, getReportJob } from '../api/report'
 import LanguageSwitcher from '../components/LanguageSwitcher.vue'
+import JobToggleButton from '../components/JobToggleButton.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -110,14 +118,73 @@ const rightPanelStyle = computed(() => {
 
 // --- Status Computed ---
 const statusClass = computed(() => {
+  if (jobState.value === 'paused') return 'paused'
   return currentStatus.value
 })
 
 const statusText = computed(() => {
+  if (jobState.value === 'paused') return t('common.paused')
   if (currentStatus.value === 'error') return 'Error'
   if (currentStatus.value === 'completed') return 'Completed'
   return 'Generating'
 })
+
+// --- 暂停/继续（Step4 报告生成） ---
+const jobState = ref('idle') // idle | running | paused
+const jobBusy = ref(false)
+const jobToggleVisible = computed(
+  () => (jobState.value === 'running' || jobState.value === 'paused') && !!simulationId.value
+)
+
+const updateStatus = (status) => {
+  currentStatus.value = status
+  if (status === 'paused') {
+    jobState.value = 'paused'
+  } else if (status === 'processing' || status === 'generating') {
+    if (jobState.value !== 'paused') jobState.value = 'running'
+  } else if (status === 'completed' || status === 'error') {
+    jobState.value = 'idle'
+  }
+}
+
+const handlePauseReport = async () => {
+  if (jobBusy.value) return
+  jobBusy.value = true
+  try {
+    await pauseReport({ simulation_id: simulationId.value })
+    jobState.value = 'paused'
+  } catch (err) {
+    console.warn('Pause report failed:', err)
+  } finally {
+    jobBusy.value = false
+  }
+}
+
+const handleResumeReport = async () => {
+  if (jobBusy.value) return
+  jobBusy.value = true
+  try {
+    await resumeReport({ simulation_id: simulationId.value })
+    jobState.value = 'running'
+  } catch (err) {
+    console.warn('Resume report failed:', err)
+  } finally {
+    jobBusy.value = false
+  }
+}
+
+// 页面重开时校正：只有真正运行中的报告作业才显示暂停按钮
+const syncJobStateFromServer = async () => {
+  try {
+    const res = await getReportJob({ simulation_id: simulationId.value })
+    const state = res?.data?.state
+    if (state === 'paused') jobState.value = 'paused'
+    else if (state === 'running') jobState.value = 'running'
+    else if (state === 'completed') jobState.value = 'idle'
+  } catch {
+    jobState.value = 'idle'
+  }
+}
 
 // --- Helpers ---
 const addLog = (msg) => {
@@ -126,10 +193,6 @@ const addLog = (msg) => {
   if (systemLogs.value.length > 200) {
     systemLogs.value.shift()
   }
-}
-
-const updateStatus = (status) => {
-  currentStatus.value = status
 }
 
 // --- Layout Methods ---
@@ -153,6 +216,9 @@ const loadReportData = async () => {
       simulationId.value = reportData.simulation_id
 
       if (simulationId.value) {
+        // 恢复报告生成作业的暂停/运行状态
+        syncJobStateFromServer()
+
         // 获取 simulation 信息
         const simRes = await getSimulation(simulationId.value)
         if (simRes.success && simRes.data) {
@@ -329,6 +395,7 @@ onMounted(() => {
 .status-indicator.processing .dot { background: #FF9800; animation: pulse 1s infinite; }
 .status-indicator.completed .dot { background: #4CAF50; }
 .status-indicator.error .dot { background: #F44336; }
+.status-indicator.paused .dot { background: #999; box-shadow: 0 0 0 3px rgba(0,0,0,0.08); }
 
 @keyframes pulse { 50% { opacity: 0.5; } }
 

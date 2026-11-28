@@ -23,7 +23,12 @@
     "minutes": "minutes",
     "rounds": "rounds",
     "items": "items",
-    "files": "files"
+    "files": "files",
+    "pause": "Pause",
+    "resume": "Resume",
+    "paused": "Paused",
+    "pauseHint": "Pause this step; completed work is kept",
+    "resumeHint": "Continue from where it stopped"
   },
   "meta": {
     "title": "Omniprediction - Predict Everything",
@@ -388,7 +393,13 @@
     "envRunning": "Environment is running and ready for Interview commands",
     "envNotRunningShort": "Environment not running or closed",
     "requireGraphIdAndQuery": "Please provide graph_id and query",
-    "initReportAgent": "Initializing Report Agent..."
+    "initReportAgent": "Initializing Report Agent...",
+    "graphBuildPaused": "Graph build paused. You can resume anytime.",
+    "graphNotBuilding": "No graph build is currently running.",
+    "preparePaused": "Environment setup paused. Completed profiles are kept.",
+    "reportPaused": "Report generation paused. Completed sections are kept.",
+    "prepareNotRunning": "No environment preparation is currently running.",
+    "reportNotRunning": "No report is currently being generated."
   },
   "progress": {
     "initGraphService": "Initializing graph build service...",
@@ -450,7 +461,9 @@
     "readingGraphEntities": "Reading Graph Entities",
     "generatingProfiles": "Generating Agent Profiles",
     "generatingSimConfig": "Generating Simulation Config",
-    "preparingScripts": "Preparing Scripts"
+    "preparingScripts": "Preparing Scripts",
+    "prepareComplete": "Environment preparation complete",
+    "reportPaused": "Report generation paused; completed sections are kept"
   },
   "log": {
     "preparingGoBack": "Preparing to return to Step 2, closing simulation...",
